@@ -1,0 +1,19 @@
+[package]
+name = "Dynamic-Secure-Portable-Volume"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+aes = "0.9.0"
+argon2 = "0.5.3"
+bytes = "1.11.1"
+ctr = "0.10.0"
+dav-server = "0.11.0"
+fs4 = "0.13.1"
+futures-util = "0.3.32"
+hyper = { version = "1.9.0", features = ["full"] }
+hyper-util = { version = "0.1.20", features = ["full"] }
+rand = { version = "0.10.0", features = ["default"] }
+rpassword = "7.4.0"
+tokio = { version = "1.51.1", features = ["full"] }
+zeroize = { version = "1.8.2", features = ["zeroize_derive"] }
