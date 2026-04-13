@@ -1,8 +1,5 @@
-//! Intégration WebDAV pour exposer un volume chiffré via le protocole DAV.
-//! Utilise la crate `dav-server` (v0.11.0) et mappe dynamiquement un dossier physique.
-
 use std::fs;
-use std::io::{self, SeekFrom};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
@@ -15,14 +12,12 @@ use dav_server::fs::{
 use futures_util::future::BoxFuture;
 use futures_util::stream;
 
-use crate::crypto::cipher::{Aes256CtrCipher, ChunkCipher};
+use crate::crypto::cipher::Aes256XtsCipher;
+use crate::crypto::cipher::ChunkCipher;
+use crate::storage::cache::FileCache;
 use crate::storage::chunk_io::EncryptedFile;
-use crate::storage::header::HEADER_SIZE;
+use crate::storage::header::{HEADER_SIZE, LOGICAL_SIZE_OFFSET};
 use crate::utils::memory::SecureKey;
-
-// ------------------------------------------------------------
-// 1. Métadonnées (Fichiers et Dossiers)
-// ------------------------------------------------------------
 
 #[derive(Debug, Clone)]
 pub struct WebDavMetaData {
@@ -32,14 +27,25 @@ pub struct WebDavMetaData {
 }
 
 impl WebDavMetaData {
-    fn from_physical(metadata: fs::Metadata) -> Self {
+    fn resolve(phys_path: &Path, metadata: fs::Metadata, cache: &FileCache) -> Self {
         let is_dir = metadata.is_dir();
-        let physical_size = metadata.len();
-        let logical_size = if is_dir {
-            0
-        } else {
-            physical_size.saturating_sub(HEADER_SIZE)
-        };
+        let mut logical_size = 0;
+
+        if !is_dir {
+            if let Some(cached_file) = cache.get_cached(phys_path) {
+                if let Ok(guard) = cached_file.lock() {
+                    logical_size = guard.logical_size().unwrap_or(0);
+                }
+            } else if metadata.len() >= HEADER_SIZE
+                && let Ok(mut f) = fs::File::open(phys_path)
+                && f.seek(io::SeekFrom::Start(LOGICAL_SIZE_OFFSET)).is_ok()
+            {
+                let mut buf = [0u8; 8];
+                if f.read_exact(&mut buf).is_ok() {
+                    logical_size = u64::from_le_bytes(buf);
+                }
+            }
+        }
 
         Self {
             logical_size,
@@ -53,23 +59,16 @@ impl DavMetaData for WebDavMetaData {
     fn len(&self) -> u64 {
         self.logical_size
     }
-
     fn modified(&self) -> FsResult<SystemTime> {
         Ok(self.modified)
     }
-
     fn is_dir(&self) -> bool {
         self.is_dir
     }
-
     fn created(&self) -> FsResult<SystemTime> {
         Ok(self.modified)
     }
 }
-
-// ------------------------------------------------------------
-// 2. Entrée de répertoire
-// ------------------------------------------------------------
 
 pub struct WebDavDirEntry {
     name: String,
@@ -80,19 +79,14 @@ impl DavDirEntry for WebDavDirEntry {
     fn name(&self) -> Vec<u8> {
         self.name.as_bytes().to_vec()
     }
-
     fn metadata(&self) -> BoxFuture<'_, FsResult<Box<dyn DavMetaData>>> {
         let meta = self.metadata.clone();
         Box::pin(async move { Ok(Box::new(meta) as Box<dyn DavMetaData>) })
     }
 }
 
-// ------------------------------------------------------------
-// 3. Fichier Virtuel Chiffré (Wrapper Stateful)
-// ------------------------------------------------------------
-
 pub struct WebDavFile {
-    inner: Arc<Mutex<EncryptedFile<Aes256CtrCipher>>>,
+    inner: Arc<Mutex<EncryptedFile<Aes256XtsCipher>>>,
     pos: u64,
 }
 
@@ -141,16 +135,10 @@ impl DavFile for WebDavFile {
         Box::pin(async move {
             let len = data_vec.len() as u64;
             let result = tokio::task::spawn_blocking(move || {
-                let mut guard = match inner.lock() {
-                    Ok(guard) => guard,
-                    Err(poisoned) => {
-                        eprintln!(
-                            "[!] Avertissement : Récupération d'un Mutex empoisonné sur un fichier."
-                        );
-                        poisoned.into_inner()
-                    }
-                };
-                guard.write_chunk(offset, &data_vec)
+                let mut guard = inner.lock().map_err(|_| FsError::GeneralFailure)?;
+                guard
+                    .write_chunk(offset, &data_vec)
+                    .map_err(|_| FsError::GeneralFailure)
             })
             .await
             .map_err(|_| FsError::GeneralFailure)?;
@@ -160,10 +148,7 @@ impl DavFile for WebDavFile {
                     self.pos += len;
                     Ok(())
                 }
-                Err(e) => {
-                    eprintln!("[!] Erreur I/O physique lors de l'écriture : {}", e);
-                    Err(FsError::GeneralFailure)
-                }
+                Err(_) => Err(FsError::GeneralFailure),
             }
         })
     }
@@ -174,7 +159,7 @@ impl DavFile for WebDavFile {
 
         Box::pin(async move {
             let result = tokio::task::spawn_blocking(move || {
-                let mut guard = inner.lock().unwrap();
+                let mut guard = inner.lock().map_err(|_| FsError::GeneralFailure)?;
                 guard.read_chunk(offset, count)
             })
             .await
@@ -223,28 +208,37 @@ impl DavFile for WebDavFile {
     }
 
     fn flush(&mut self) -> BoxFuture<'_, FsResult<()>> {
-        Box::pin(async move { Ok(()) })
+        let inner = self.inner.clone();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                let mut guard = inner.lock().map_err(|_| FsError::GeneralFailure)?;
+                guard.flush().map_err(|_| FsError::GeneralFailure)
+            })
+            .await
+            .map_err(|_| FsError::GeneralFailure)?
+        })
     }
 }
-
-// ------------------------------------------------------------
-// 4. Système de fichiers WebDAV Dynamique
-// ------------------------------------------------------------
 
 #[derive(Clone)]
 pub struct WebDavFS {
     physical_root: PathBuf,
     master_key: SecureKey,
+    cache: Arc<FileCache>,
 }
 
 impl WebDavFS {
-    pub fn new<P: AsRef<Path>>(physical_root: P, master_key: SecureKey) -> Self {
+    pub fn new<P: AsRef<Path>>(
+        physical_root: P,
+        master_key: SecureKey,
+        cache: Arc<FileCache>,
+    ) -> Self {
         Self {
             physical_root: physical_root.as_ref().to_path_buf(),
             master_key,
+            cache,
         }
     }
-
     fn physical_path(&self, dav_path: &DavPath) -> PathBuf {
         self.physical_root.join(dav_path.as_rel_ospath())
     }
@@ -257,34 +251,41 @@ impl DavFileSystem for WebDavFS {
         options: OpenOptions,
     ) -> BoxFuture<'a, FsResult<Box<dyn DavFile>>> {
         let phys_path = self.physical_path(path);
+        let master_key = self.master_key.clone();
+        let cache = self.cache.clone();
 
         Box::pin(async move {
             if phys_path.is_dir() {
                 return Err(FsError::Forbidden);
             }
 
-            // On ne tronque QUE si l'option truncate est explicitement à true
-            let should_truncate = options.truncate;
             let write_access = options.write || options.append || options.truncate;
-            let master_key = self.master_key.clone();
 
-            let result: io::Result<EncryptedFile<Aes256CtrCipher>> =
-                tokio::task::spawn_blocking(move || {
-                    EncryptedFile::open(
-                        &phys_path,
-                        Aes256CtrCipher::new(master_key),
-                        should_truncate,
-                        write_access,
-                    )
-                })
-                .await
-                .map_err(|_| FsError::GeneralFailure)?;
+            let result = tokio::task::spawn_blocking(move || {
+                cache.get_or_open(
+                    &phys_path,
+                    Aes256XtsCipher::new(master_key),
+                    options.truncate,
+                    write_access,
+                )
+            })
+            .await
+            .map_err(|_| FsError::GeneralFailure)?;
 
             match result {
-                Ok(enc_file) => Ok(Box::new(WebDavFile {
-                    inner: Arc::new(Mutex::new(enc_file)),
-                    pos: 0,
-                }) as Box<dyn DavFile>),
+                Ok(shared_file) => {
+                    // CORRECTION : Gestion vitale du mode 'append' pour l'OS
+                    let initial_pos = if options.append {
+                        shared_file.lock().unwrap().logical_size().unwrap_or(0)
+                    } else {
+                        0
+                    };
+
+                    Ok(Box::new(WebDavFile {
+                        inner: shared_file,
+                        pos: initial_pos,
+                    }) as Box<dyn DavFile>)
+                }
                 Err(_) => Err(FsError::NotFound),
             }
         })
@@ -292,11 +293,13 @@ impl DavFileSystem for WebDavFS {
 
     fn metadata<'a>(&'a self, path: &'a DavPath) -> BoxFuture<'a, FsResult<Box<dyn DavMetaData>>> {
         let phys_path = self.physical_path(path);
+        let cache = self.cache.clone();
+
         Box::pin(async move {
-            match fs::metadata(&phys_path) {
-                Ok(meta) => {
-                    Ok(Box::new(WebDavMetaData::from_physical(meta)) as Box<dyn DavMetaData>)
-                }
+            tokio::task::spawn_blocking(move || match fs::metadata(&phys_path) {
+                // CORRECTION : Appel de resolve avec le cache pour éviter l'I/O inutile
+                Ok(meta) => Ok(Box::new(WebDavMetaData::resolve(&phys_path, meta, &cache))
+                    as Box<dyn DavMetaData>),
                 Err(e) => {
                     if e.kind() == io::ErrorKind::NotFound {
                         Err(FsError::NotFound)
@@ -304,7 +307,9 @@ impl DavFileSystem for WebDavFS {
                         Err(FsError::GeneralFailure)
                     }
                 }
-            }
+            })
+            .await
+            .map_err(|_| FsError::GeneralFailure)?
         })
     }
 
@@ -319,58 +324,86 @@ impl DavFileSystem for WebDavFS {
         >,
     > {
         let phys_path = self.physical_path(path);
+        let cache = self.cache.clone();
+
         Box::pin(async move {
-            let mut entries: Vec<Box<dyn DavDirEntry>> = Vec::new();
+            let entries = tokio::task::spawn_blocking(move || {
+                let mut results: Vec<Box<dyn DavDirEntry>> = Vec::new();
+                let read_dir = match fs::read_dir(&phys_path) {
+                    Ok(dir) => dir,
+                    Err(_) => return Err(FsError::NotFound),
+                };
 
-            let read_dir = match fs::read_dir(&phys_path) {
-                Ok(dir) => dir,
-                Err(_) => return Err(FsError::NotFound),
-            };
+                for entry in read_dir.flatten() {
+                    if let Ok(meta) = entry.metadata() {
+                        let name = entry.file_name().to_string_lossy().to_string();
+                        if name == "dspv.meta" || name.starts_with('.') {
+                            continue;
+                        }
 
-            for entry in read_dir.flatten() {
-                if let Ok(meta) = entry.metadata() {
-                    let name = entry.file_name().to_string_lossy().to_string();
-                    if name == "dspv.meta" || name.starts_with('.') {
-                        continue;
+                        // CORRECTION : Passage du cache à la résolution des métadonnées
+                        results.push(Box::new(WebDavDirEntry {
+                            name,
+                            metadata: WebDavMetaData::resolve(&entry.path(), meta, &cache),
+                        }) as Box<dyn DavDirEntry>);
                     }
-
-                    entries.push(Box::new(WebDavDirEntry {
-                        name,
-                        metadata: WebDavMetaData::from_physical(meta),
-                    }) as Box<dyn DavDirEntry>);
                 }
-            }
+                Ok(results)
+            })
+            .await
+            .map_err(|_| FsError::GeneralFailure)??;
 
             let s = stream::iter(entries.into_iter().map(Ok));
-            Ok(Box::pin(s)
-                as std::pin::Pin<
-                    Box<dyn stream::Stream<Item = FsResult<Box<dyn DavDirEntry>>> + Send>,
-                >)
+            Ok(Box::pin(s) as _)
         })
     }
 
     fn create_dir<'a>(&'a self, path: &'a DavPath) -> BoxFuture<'a, FsResult<()>> {
         let phys_path = self.physical_path(path);
-        Box::pin(async move { fs::create_dir(&phys_path).map_err(|_| FsError::GeneralFailure) })
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || fs::create_dir(&phys_path))
+                .await
+                .map_err(|_| FsError::GeneralFailure)?
+                .map_err(|_| FsError::GeneralFailure)
+        })
     }
 
     fn remove_file<'a>(&'a self, path: &'a DavPath) -> BoxFuture<'a, FsResult<()>> {
         let phys_path = self.physical_path(path);
-        Box::pin(async move { fs::remove_file(&phys_path).map_err(|_| FsError::GeneralFailure) })
+        let cache = self.cache.clone();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                cache.remove(&phys_path);
+                fs::remove_file(&phys_path)
+            })
+            .await
+            .map_err(|_| FsError::GeneralFailure)?
+            .map_err(|_| FsError::GeneralFailure)
+        })
     }
 
     fn remove_dir<'a>(&'a self, path: &'a DavPath) -> BoxFuture<'a, FsResult<()>> {
         let phys_path = self.physical_path(path);
-        Box::pin(async move { fs::remove_dir(&phys_path).map_err(|_| FsError::GeneralFailure) })
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || fs::remove_dir(&phys_path))
+                .await
+                .map_err(|_| FsError::GeneralFailure)?
+                .map_err(|_| FsError::GeneralFailure)
+        })
     }
 
     fn rename<'a>(&'a self, from: &'a DavPath, to: &'a DavPath) -> BoxFuture<'a, FsResult<()>> {
         let from_path = self.physical_path(from);
         let to_path = self.physical_path(to);
+        let cache = self.cache.clone();
 
         Box::pin(async move {
             tokio::task::spawn_blocking(move || {
-                fs::rename(from_path, to_path).map_err(|_| FsError::GeneralFailure)
+                cache.remove(&from_path);
+                fs::rename(from_path, to_path).map_err(|e| match e.kind() {
+                    io::ErrorKind::NotFound => FsError::NotFound,
+                    _ => FsError::GeneralFailure,
+                })
             })
             .await
             .map_err(|_| FsError::GeneralFailure)?
@@ -384,47 +417,33 @@ impl DavFileSystem for WebDavFS {
 
         Box::pin(async move {
             tokio::task::spawn_blocking(move || {
-                // 1. Instancier les chiffreurs (un pour la lecture, un pour l'écriture)
-                // Note : On clone la clé sécurisée (SecureKey), ce qui est sûr car elle sera zeroizée au drop.
-                let cipher_src = Aes256CtrCipher::new(master_key.clone());
-                let cipher_dst = Aes256CtrCipher::new(master_key);
+                let cipher_src = Aes256XtsCipher::new(master_key.clone());
+                let cipher_dst = Aes256XtsCipher::new(master_key);
 
-                // 2. Ouvrir le fichier source (truncate = false pour lire l'en-tête existant, write_access = false)
                 let mut src_file = EncryptedFile::open(&from_path, cipher_src, false, false)
                     .map_err(|_| FsError::NotFound)?;
-
-                // 3. Récupérer la taille logique pour borner la copie
                 let logical_size = src_file
                     .logical_size()
                     .map_err(|_| FsError::GeneralFailure)?;
 
-                // 4. Ouvrir/Créer le fichier de destination
-                // CRITIQUE : truncate = true force la génération d'un NOUVEAU FileHeader avec un nouvel IV
-                // write_access = true car on va copier des données dedans
                 let mut dst_file = EncryptedFile::open(&to_path, cipher_dst, true, true)
                     .map_err(|_| FsError::GeneralFailure)?;
 
-                // 5. Streaming par blocs (Chunking) pour préserver la RAM
-                let chunk_size: usize = 64 * 1024; // 64 Ko par itération (compromis idéal vitesse/mémoire)
+                let chunk_size: usize = 64 * 1024;
                 let mut offset: u64 = 0;
 
                 while offset < logical_size {
                     let remaining = (logical_size - offset) as usize;
                     let current_chunk_size = remaining.min(chunk_size);
 
-                    // Lecture et déchiffrement (le résultat atterrit dans un SecureBuffer)
                     let secure_buf = src_file
                         .read_chunk(offset, current_chunk_size)
                         .map_err(|_| FsError::GeneralFailure)?;
-
-                    // Chiffrement et écriture avec le nouvel IV
                     dst_file
                         .write_chunk(offset, &secure_buf.0)
                         .map_err(|_| FsError::GeneralFailure)?;
-
                     offset += current_chunk_size as u64;
                 }
-
                 Ok(())
             })
             .await
@@ -433,27 +452,18 @@ impl DavFileSystem for WebDavFS {
     }
 
     fn get_quota(&self) -> BoxFuture<'_, FsResult<(u64, Option<u64>)>> {
-        // On clone le chemin physique pour pouvoir le déplacer dans le thread bloquant
         let phys_root = self.physical_root.clone();
-
         Box::pin(async move {
             let result = tokio::task::spawn_blocking(move || {
-                // fs4 interroge l'OS (Windows/macOS/Linux) pour obtenir l'espace réel
-                // du disque hébergeant le dossier physique.
                 let total_space = fs4::total_space(&phys_root).unwrap_or(0);
                 let available_space = fs4::available_space(&phys_root).unwrap_or(0);
-
-                // Le quota utilisé est calculé par déduction
-                let used_space = total_space.saturating_sub(available_space);
-
-                (used_space, Some(total_space))
+                (
+                    total_space.saturating_sub(available_space),
+                    Some(total_space),
+                )
             })
             .await
-            .map_err(|e| {
-                eprintln!("[!] Erreur de thread lors du calcul du quota : {}", e);
-                FsError::GeneralFailure
-            })?;
-
+            .map_err(|_| FsError::GeneralFailure)?;
             Ok(result)
         })
     }
@@ -468,93 +478,147 @@ mod tests {
     use super::*;
     use dav_server::fs::OpenOptions;
     use std::fs;
-    use std::io::Write;
 
     // --- Helper ---
     fn setup_test_env(dir_name: &str) -> (WebDavFS, SecureKey) {
         let _ = fs::remove_dir_all(dir_name);
         fs::create_dir_all(dir_name).unwrap();
-        let master_key = SecureKey(vec![0x42; 32]);
-        let dav_fs = WebDavFS::new(dir_name, master_key.clone());
-        (dav_fs, master_key)
+        let master_key = SecureKey(vec![0x42; 64]);
+        let cache = std::sync::Arc::new(crate::storage::cache::FileCache::new());
+        (
+            WebDavFS::new(dir_name, master_key.clone(), cache),
+            master_key,
+        )
     }
 
-    // 1. Test des métadonnées (Calcul Taille Logique vs Physique)
+    /// TEST 1 : Cycle de vie complet d'un fichier (Création, I/O, Append, Truncate, Seek, Comportement Windows)
     #[tokio::test]
-    async fn test_metadata_logic() {
-        let root = "test_meta";
+    async fn test_webdav_file_lifecycle_and_io() {
+        let root = "test_io";
         let (dav_fs, _) = setup_test_env(root);
-        let path = DavPath::new("/file.enc").unwrap();
+        let path = DavPath::new("/lifecycle.enc").unwrap();
 
-        // Création physique d'un fichier avec en-tête + 10 octets
-        let phys_path = PathBuf::from(root).join("file.enc");
-        let mut f = fs::File::create(&phys_path).unwrap();
-        f.write_all(&[0u8; (HEADER_SIZE + 10) as usize]).unwrap();
+        // 1. Création et écriture initiale
+        {
+            let mut f = dav_fs
+                .open(
+                    &path,
+                    OpenOptions {
+                        create: true,
+                        write: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            f.write_bytes(Bytes::from("Hello")).await.unwrap();
+        }
 
-        let meta = dav_fs.metadata(&path).await.unwrap();
+        // 2. Mode Append (Vérifie que l'offset reprend à la fin sans écraser)
+        {
+            let mut f = dav_fs
+                .open(
+                    &path,
+                    OpenOptions {
+                        append: true,
+                        write: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            f.write_bytes(Bytes::from(" World")).await.unwrap();
+        }
+
+        // 3. Lecture et Seek (Vérification globale + Simulation OS Windows)
+        {
+            let mut f = dav_fs
+                .open(
+                    &path,
+                    OpenOptions {
+                        read: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                f.metadata().await.unwrap().len(),
+                11,
+                "La taille logique doit être de 11 après l'append"
+            );
+
+            f.seek(SeekFrom::Start(0)).await.unwrap();
+            assert_eq!(
+                f.read_bytes(11).await.unwrap().as_ref(),
+                b"Hello World",
+                "Le contenu déchiffré est erroné"
+            );
+
+            // Validation des Seek relatifs et par la fin
+            assert_eq!(f.seek(SeekFrom::End(-5)).await.unwrap(), 6);
+            assert_eq!(f.seek(SeekFrom::Current(2)).await.unwrap(), 8);
+            assert!(f.flush().await.is_ok());
+        }
+
+        // 4. Mode Truncate (Écrase les anciennes données)
+        {
+            let mut f = dav_fs
+                .open(
+                    &path,
+                    OpenOptions {
+                        truncate: true,
+                        write: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            f.write_bytes(Bytes::from("NEW")).await.unwrap();
+        }
+
         assert_eq!(
-            meta.len(),
-            10,
-            "La taille logique doit être TaillePhysique - HEADER_SIZE"
+            dav_fs.metadata(&path).await.unwrap().len(),
+            3,
+            "Le Truncate n'a pas réinitialisé la taille logique"
         );
-        assert!(!meta.is_dir());
 
         let _ = fs::remove_dir_all(root);
     }
 
-    // 2. Test du Seek (Start, Current, End)
+    /// TEST 2 : Manipulation de l'arbre de fichiers (Listage filtré, Renommage, Copie, Suppression)
     #[tokio::test]
-    async fn test_file_seek_logic() {
-        let root = "test_seek";
+    async fn test_webdav_fs_operations() {
+        let root = "test_fs_ops";
         let (dav_fs, _) = setup_test_env(root);
-        let path = DavPath::new("/seek.enc").unwrap();
 
-        let mut file = dav_fs
-            .open(
-                &path,
-                OpenOptions {
-                    read: true,
-                    write: true,
-                    create: true,
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
+        let p_vis = DavPath::new("/visible.enc").unwrap();
 
-        // On écrit 20 octets
-        file.write_bytes(Bytes::from(vec![0u8; 20])).await.unwrap();
+        // CORRECTION 1 : Création propre via WebDAV pour générer le FileHeader (32 octets)
+        {
+            let mut f = dav_fs
+                .open(
+                    &p_vis,
+                    OpenOptions {
+                        create: true,
+                        write: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            f.write_bytes(Bytes::from("test")).await.unwrap();
+        }
 
-        // Test Seek Start
-        assert_eq!(file.seek(SeekFrom::Start(5)).await.unwrap(), 5);
-
-        // Test Seek Current
-        assert_eq!(file.seek(SeekFrom::Current(2)).await.unwrap(), 7);
-        assert_eq!(file.seek(SeekFrom::Current(-3)).await.unwrap(), 4);
-
-        // Test Seek End
-        assert_eq!(file.seek(SeekFrom::End(-5)).await.unwrap(), 15);
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    // 3. Test du Listage (Filtrage des fichiers cachés)
-    #[tokio::test]
-    async fn test_fs_list_filtering() {
-        let root = "test_list";
-        let _ = fs::remove_dir_all(root);
-        fs::create_dir_all(root).unwrap();
-
-        // Création d'un fichier normal et d'un fichier caché
-        fs::File::create(PathBuf::from(root).join("visible.enc")).unwrap();
+        // Le fichier caché peut être créé physiquement car on teste juste qu'il est ignoré par read_dir
         fs::File::create(PathBuf::from(root).join(".hidden")).unwrap();
 
-        let dav_fs = WebDavFS::new(root, SecureKey(vec![0; 32]));
+        // 2. Filtrage au listage
+        let root_path = DavPath::new("/").unwrap();
         let entries = dav_fs
-            .read_dir(&DavPath::new("/").unwrap(), ReadDirMeta::None)
+            .read_dir(&root_path, ReadDirMeta::None)
             .await
             .unwrap();
-
         let names: Vec<String> = stream::StreamExt::collect::<Vec<_>>(entries)
             .await
             .into_iter()
@@ -564,131 +628,105 @@ mod tests {
         assert!(names.contains(&"visible.enc".to_string()));
         assert!(
             !names.contains(&".hidden".to_string()),
-            "Les fichiers commençant par '.' doivent être ignorés"
+            "Les fichiers cachés doivent être ignorés"
         );
 
+        // 3. Copie et Renommage
+        let p_copy = DavPath::new("/copy.enc").unwrap();
+        let p_rename = DavPath::new("/rename.enc").unwrap();
+
+        dav_fs.copy(&p_vis, &p_copy).await.unwrap();
+        assert!(
+            fs::metadata(PathBuf::from(root).join("copy.enc")).is_ok(),
+            "Copie échouée"
+        );
+
+        dav_fs.rename(&p_copy, &p_rename).await.unwrap();
+        assert!(
+            fs::metadata(PathBuf::from(root).join("copy.enc")).is_err(),
+            "L'ancien fichier post-renommage existe toujours"
+        );
+        assert!(
+            fs::metadata(PathBuf::from(root).join("rename.enc")).is_ok(),
+            "Le nouveau fichier n'existe pas"
+        );
+
+        // 4. Suppression
+        dav_fs.remove_file(&p_vis).await.unwrap();
+        dav_fs.remove_file(&p_rename).await.unwrap();
+        assert!(fs::metadata(PathBuf::from(root).join("visible.enc")).is_err());
+
+        let d_dir = DavPath::new("/dir").unwrap();
+        dav_fs.create_dir(&d_dir).await.unwrap();
+        dav_fs.remove_dir(&d_dir).await.unwrap();
+        assert!(fs::metadata(PathBuf::from(root).join("dir")).is_err());
+
         let _ = fs::remove_dir_all(root);
     }
 
-    // 4. Test Rename (Déplacement physique)
+    /// TEST 3 : Résolution des Métadonnées (Cache RAM vs Header Physique) et Quota OS
     #[tokio::test]
-    async fn test_fs_rename() {
-        let root = "test_rename";
+    async fn test_webdav_metadata_cache_and_quota() {
+        let root = "test_meta_quota";
         let (dav_fs, _) = setup_test_env(root);
-        let p1 = DavPath::new("/old.enc").unwrap();
-        let p2 = DavPath::new("/new.enc").unwrap();
+        let path = DavPath::new("/cache_test.enc").unwrap();
+        let phys_path = PathBuf::from(root).join("cache_test.enc");
 
-        fs::File::create(PathBuf::from(root).join("old.enc")).unwrap();
-        dav_fs.rename(&p1, &p2).await.unwrap();
-
-        assert!(fs::metadata(PathBuf::from(root).join("new.enc")).is_ok());
-        assert!(fs::metadata(PathBuf::from(root).join("old.enc")).is_err());
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    // 5. Test Copy (Duplication physique)
-    #[tokio::test]
-    async fn test_fs_copy() {
-        let root = "test_copy";
-        let (dav_fs, _) = setup_test_env(root);
-        let p1 = DavPath::new("/src.enc").unwrap();
-        let p2 = DavPath::new("/dst.enc").unwrap();
-
-        // Création d'un vrai fichier chiffré via WebDAV pour générer l'en-tête (Header)
+        // 1. Test du Cache RAM (Fichier verrouillé et non flushé)
         {
-            let mut f = dav_fs
+            let mut file = dav_fs
                 .open(
-                    &p1,
+                    &path,
                     OpenOptions {
                         create: true,
-                        truncate: true,
                         write: true,
                         ..Default::default()
                     },
                 )
                 .await
                 .unwrap();
-            f.write_bytes(Bytes::from("données de test")).await.unwrap();
-        } // Le fichier est fermé (drop) ici
-        dav_fs.copy(&p1, &p2).await.unwrap();
+            file.write_bytes(Bytes::from("Data")).await.unwrap();
 
-        assert!(fs::metadata(PathBuf::from(root).join("src.enc")).is_ok());
-        assert!(fs::metadata(PathBuf::from(root).join("dst.enc")).is_ok());
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    // 6. Test de suppression (Fichier et Dossier)
-    #[tokio::test]
-    async fn test_fs_deletion() {
-        let root = "test_del";
-        let (dav_fs, _) = setup_test_env(root);
-
-        // Dossier
-        let d = DavPath::new("/dir").unwrap();
-        dav_fs.create_dir(&d).await.unwrap();
-        dav_fs.remove_dir(&d).await.unwrap();
-        assert!(fs::metadata(PathBuf::from(root).join("dir")).is_err());
-
-        // Fichier
-        let f = DavPath::new("/file.enc").unwrap();
-        fs::File::create(PathBuf::from(root).join("file.enc")).unwrap();
-        dav_fs.remove_file(&f).await.unwrap();
-        assert!(fs::metadata(PathBuf::from(root).join("file.enc")).is_err());
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
-    async fn test_webdav_windows_behavior_simulation() {
-        let root = "test_windows_sim";
-        let (dav_fs, _) = setup_test_env(root);
-
-        let file_path = DavPath::new("/win_test.txt").unwrap();
-        let content = b"Donnees secretes 123";
-
-        // 1. SIMULATION CRÉATION (Windows fait souvent un open avec truncate)
-        {
-            let opts = OpenOptions {
-                create: true,
-                truncate: true,
-                write: true,
-                ..Default::default()
-            };
-            let mut file = dav_fs.open(&file_path, opts).await.unwrap();
-            file.write_bytes(Bytes::copy_from_slice(content))
-                .await
-                .unwrap();
-            // Le fichier est DROP ici (fermé)
-        }
-
-        // 2. SIMULATION LECTURE (Windows rouvre le fichier sans truncate)
-        {
-            let opts = OpenOptions {
-                read: true,
-                write: false,
-                ..Default::default()
-            };
-            let mut file = dav_fs.open(&file_path, opts).await.unwrap();
-
-            // On vérifie d'abord les métadonnées (Windows le fait toujours avant de lire)
-            let meta = file.metadata().await.unwrap();
+            // Le fichier I/O est toujours ouvert, les métadonnées doivent être interceptées depuis le cache RAM
             assert_eq!(
-                meta.len(),
-                content.len() as u64,
-                "La taille lue par l'OS est erronée !"
+                dav_fs.metadata(&path).await.unwrap().len(),
+                4,
+                "La résolution n'a pas utilisé le cache RAM"
             );
+        } // file est drop ici (flush et fermeture OS garantis)
 
-            // Lecture réelle
-            file.seek(io::SeekFrom::Start(0)).await.unwrap();
-            let data = file.read_bytes(content.len()).await.unwrap();
-            assert_eq!(
-                data.as_ref(),
-                content,
-                "Le contenu déchiffré est vide ou incorrect !"
-            );
-        }
+        // CORRECTION 2 : Éviction explicite du cache RAM pour obliger le système à relire le disque
+        dav_fs.cache.remove(&phys_path);
+
+        // 2. Test du Fallback I/O (Émulation d'un fichier existant lu depuis le header physique)
+        let mut f = fs::OpenOptions::new().write(true).open(&phys_path).unwrap();
+
+        // On forge un FileHeader avec une fausse taille logique pour prouver qu'il est bien lu sur le disque
+        let mut header = crate::storage::header::FileHeader::generate_new();
+        header.logical_size = 999;
+        f.seek(std::io::SeekFrom::Start(0)).unwrap();
+        header.write_to(&mut f).unwrap();
+        drop(f); // Relâchement explicite du lock OS
+
+        assert_eq!(
+            dav_fs.metadata(&path).await.unwrap().len(),
+            999,
+            "La taille n'a pas été lue depuis le FileHeader physique"
+        );
+
+        // 3. Test du Quota OS
+        let quota_result = dav_fs.get_quota().await;
+        assert!(quota_result.is_ok(), "L'API de quota OS a échoué");
+
+        let (used, total) = quota_result.unwrap();
+        assert!(
+            total.unwrap() > 0,
+            "La taille totale du disque ne peut pas être de 0"
+        );
+        assert!(
+            used <= total.unwrap(),
+            "L'espace utilisé ne peut pas dépasser l'espace total"
+        );
 
         let _ = fs::remove_dir_all(root);
     }
