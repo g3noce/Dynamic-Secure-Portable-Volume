@@ -1,3 +1,4 @@
+use std::fmt;
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -18,6 +19,62 @@ use crate::storage::cache::FileCache;
 use crate::storage::chunk_io::EncryptedFile;
 use crate::storage::header::{HEADER_SIZE, LOGICAL_SIZE_OFFSET};
 use crate::utils::memory::SecureKey;
+
+// --- AJOUT : Énumération structurée pour les erreurs personnalisées ---
+#[derive(Debug)]
+pub enum WebDavError {
+    LockFailed(&'static str),
+    WriteChunkFailed,
+    ReadChunkFailed,
+    FlushFailed,
+    CacheOpenFailed,
+    MetadataFailed,
+    ReadDirFailed,
+    CreateDirFailed,
+    RemoveFileFailed,
+    RemoveDirFailed,
+    RenameFailed,
+    CopySrcOpenFailed,
+    CopyDstOpenFailed,
+    CopyReadWriteFailed,
+    QuotaFailed,
+}
+
+impl fmt::Display for WebDavError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (func, cause) = match self {
+            WebDavError::LockFailed(f_name) => {
+                (*f_name, "impossible de verrouiller le fichier partagé")
+            }
+            WebDavError::WriteChunkFailed => ("write_bytes", "échec d'écriture du chunk chiffré"),
+            WebDavError::ReadChunkFailed => ("read_bytes", "échec de lecture du chunk chiffré"),
+            WebDavError::FlushFailed => ("flush", "échec du vidage sur disque"),
+            WebDavError::CacheOpenFailed => ("open", "échec d'ouverture ou création via le cache"),
+            WebDavError::MetadataFailed => ("metadata", "échec de récupération des métadonnées OS"),
+            WebDavError::ReadDirFailed => ("read_dir", "échec de lecture du contenu du dossier"),
+            WebDavError::CreateDirFailed => ("create_dir", "échec de création du dossier"),
+            WebDavError::RemoveFileFailed => {
+                ("remove_file", "échec de suppression du fichier physique")
+            }
+            WebDavError::RemoveDirFailed => {
+                ("remove_dir", "échec de suppression du dossier physique")
+            }
+            WebDavError::RenameFailed => ("rename", "échec du renommage sur le disque"),
+            WebDavError::CopySrcOpenFailed => ("copy", "impossible d'ouvrir le fichier source"),
+            WebDavError::CopyDstOpenFailed => ("copy", "impossible de créer le fichier cible"),
+            WebDavError::CopyReadWriteFailed => {
+                ("copy", "échec lors de la lecture/écriture des chunks")
+            }
+            WebDavError::QuotaFailed => {
+                ("get_quota", "échec de calcul de l'espace disque disponible")
+            }
+        };
+        write!(f, "mod : webdav , fonction : {} , cause : {}", func, cause)
+    }
+}
+
+impl std::error::Error for WebDavError {}
+// ----------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
 pub struct WebDavMetaData {
@@ -134,22 +191,26 @@ impl DavFile for WebDavFile {
 
         Box::pin(async move {
             let len = data_vec.len() as u64;
-            let result = tokio::task::spawn_blocking(move || {
-                let mut guard = inner.lock().map_err(|_| FsError::GeneralFailure)?;
+
+            tokio::task::spawn_blocking(move || -> Result<(), WebDavError> {
+                let mut guard = inner
+                    .lock()
+                    .map_err(|_| WebDavError::LockFailed("write_bytes"))?;
                 guard
                     .write_chunk(offset, &data_vec)
-                    .map_err(|_| FsError::GeneralFailure)
+                    .map_err(|_| WebDavError::WriteChunkFailed)?;
+                Ok(())
             })
             .await
-            .map_err(|_| FsError::GeneralFailure)?;
+            .map_err(|_| WebDavError::WriteChunkFailed)
+            .and_then(|res| res)
+            .map_err(|e| {
+                eprintln!("{}", e); // Journalisation de l'erreur formatée
+                FsError::GeneralFailure
+            })?;
 
-            match result {
-                Ok(_) => {
-                    self.pos += len;
-                    Ok(())
-                }
-                Err(_) => Err(FsError::GeneralFailure),
-            }
+            self.pos += len;
+            Ok(())
         })
     }
 
@@ -158,21 +219,25 @@ impl DavFile for WebDavFile {
         let offset = self.pos;
 
         Box::pin(async move {
-            let result = tokio::task::spawn_blocking(move || {
-                let mut guard = inner.lock().map_err(|_| FsError::GeneralFailure)?;
-                guard.read_chunk(offset, count)
+            let secure_buf = tokio::task::spawn_blocking(move || -> Result<_, WebDavError> {
+                let mut guard = inner
+                    .lock()
+                    .map_err(|_| WebDavError::LockFailed("read_bytes"))?;
+                guard
+                    .read_chunk(offset, count)
+                    .map_err(|_| WebDavError::ReadChunkFailed)
             })
             .await
-            .map_err(|_| FsError::GeneralFailure)?;
+            .map_err(|_| WebDavError::ReadChunkFailed)
+            .and_then(|res| res)
+            .map_err(|e| {
+                eprintln!("{}", e);
+                FsError::GeneralFailure
+            })?;
 
-            match result {
-                Ok(secure_buf) => {
-                    let b = Bytes::copy_from_slice(&secure_buf.0);
-                    self.pos += b.len() as u64;
-                    Ok(b)
-                }
-                Err(_) => Err(FsError::GeneralFailure),
-            }
+            let b = Bytes::copy_from_slice(&secure_buf.0);
+            self.pos += b.len() as u64;
+            Ok(b)
         })
     }
 
@@ -210,12 +275,20 @@ impl DavFile for WebDavFile {
     fn flush(&mut self) -> BoxFuture<'_, FsResult<()>> {
         let inner = self.inner.clone();
         Box::pin(async move {
-            tokio::task::spawn_blocking(move || {
-                let mut guard = inner.lock().map_err(|_| FsError::GeneralFailure)?;
-                guard.flush().map_err(|_| FsError::GeneralFailure)
+            tokio::task::spawn_blocking(move || -> Result<(), WebDavError> {
+                let mut guard = inner.lock().map_err(|_| WebDavError::LockFailed("flush"))?;
+                guard.flush().map_err(|_| WebDavError::FlushFailed)?;
+                Ok(())
             })
             .await
-            .map_err(|_| FsError::GeneralFailure)?
+            .map_err(|_| WebDavError::FlushFailed)
+            .and_then(|res| res)
+            .map_err(|e| {
+                eprintln!("{}", e);
+                FsError::GeneralFailure
+            })?;
+
+            Ok(())
         })
     }
 }
@@ -261,33 +334,34 @@ impl DavFileSystem for WebDavFS {
 
             let write_access = options.write || options.append || options.truncate;
 
-            let result = tokio::task::spawn_blocking(move || {
-                cache.get_or_open(
-                    &phys_path,
-                    Aes256XtsCipher::new(master_key),
-                    options.truncate,
-                    write_access,
-                )
+            let shared_file = tokio::task::spawn_blocking(move || -> Result<_, WebDavError> {
+                cache
+                    .get_or_open(
+                        &phys_path,
+                        Aes256XtsCipher::new(master_key),
+                        options.truncate,
+                        write_access,
+                    )
+                    .map_err(|_| WebDavError::CacheOpenFailed)
             })
             .await
-            .map_err(|_| FsError::GeneralFailure)?;
+            .map_err(|_| WebDavError::CacheOpenFailed)
+            .and_then(|res| res)
+            .map_err(|e| {
+                eprintln!("{}", e);
+                FsError::NotFound
+            })?;
 
-            match result {
-                Ok(shared_file) => {
-                    // CORRECTION : Gestion vitale du mode 'append' pour l'OS
-                    let initial_pos = if options.append {
-                        shared_file.lock().unwrap().logical_size().unwrap_or(0)
-                    } else {
-                        0
-                    };
+            let initial_pos = if options.append {
+                shared_file.lock().unwrap().logical_size().unwrap_or(0)
+            } else {
+                0
+            };
 
-                    Ok(Box::new(WebDavFile {
-                        inner: shared_file,
-                        pos: initial_pos,
-                    }) as Box<dyn DavFile>)
-                }
-                Err(_) => Err(FsError::NotFound),
-            }
+            Ok(Box::new(WebDavFile {
+                inner: shared_file,
+                pos: initial_pos,
+            }) as Box<dyn DavFile>)
         })
     }
 
@@ -296,20 +370,22 @@ impl DavFileSystem for WebDavFS {
         let cache = self.cache.clone();
 
         Box::pin(async move {
-            tokio::task::spawn_blocking(move || match fs::metadata(&phys_path) {
-                // CORRECTION : Appel de resolve avec le cache pour éviter l'I/O inutile
-                Ok(meta) => Ok(Box::new(WebDavMetaData::resolve(&phys_path, meta, &cache))
-                    as Box<dyn DavMetaData>),
-                Err(e) => {
-                    if e.kind() == io::ErrorKind::NotFound {
-                        Err(FsError::NotFound)
-                    } else {
-                        Err(FsError::GeneralFailure)
+            tokio::task::spawn_blocking(move || -> Result<Box<dyn DavMetaData>, WebDavError> {
+                match fs::metadata(&phys_path) {
+                    Ok(meta) => {
+                        Ok(Box::new(WebDavMetaData::resolve(&phys_path, meta, &cache)) as _)
                     }
+                    Err(_) => Err(WebDavError::MetadataFailed),
                 }
             })
             .await
-            .map_err(|_| FsError::GeneralFailure)?
+            .map_err(|_| WebDavError::MetadataFailed)
+            .and_then(|res| res)
+            .map_err(|_| {
+                // On ne loggue pas les erreurs Metadata car WebDAV vérifie constamment si un fichier
+                // existe ou non (NotFound attendu), cela spammerait la console inutilement.
+                FsError::NotFound
+            })
         })
     }
 
@@ -327,31 +403,34 @@ impl DavFileSystem for WebDavFS {
         let cache = self.cache.clone();
 
         Box::pin(async move {
-            let entries = tokio::task::spawn_blocking(move || {
-                let mut results: Vec<Box<dyn DavDirEntry>> = Vec::new();
-                let read_dir = match fs::read_dir(&phys_path) {
-                    Ok(dir) => dir,
-                    Err(_) => return Err(FsError::NotFound),
-                };
+            let entries = tokio::task::spawn_blocking(
+                move || -> Result<Vec<Box<dyn DavDirEntry>>, WebDavError> {
+                    let mut results: Vec<Box<dyn DavDirEntry>> = Vec::new();
+                    let read_dir = match fs::read_dir(&phys_path) {
+                        Ok(dir) => dir,
+                        Err(_) => return Err(WebDavError::ReadDirFailed),
+                    };
 
-                for entry in read_dir.flatten() {
-                    if let Ok(meta) = entry.metadata() {
-                        let name = entry.file_name().to_string_lossy().to_string();
-                        if name == "dspv.meta" || name.starts_with('.') {
-                            continue;
+                    for entry in read_dir.flatten() {
+                        if let Ok(meta) = entry.metadata() {
+                            let name = entry.file_name().to_string_lossy().to_string();
+                            if name == "dspv.meta" || name.starts_with('.') {
+                                continue;
+                            }
+
+                            results.push(Box::new(WebDavDirEntry {
+                                name,
+                                metadata: WebDavMetaData::resolve(&entry.path(), meta, &cache),
+                            }) as Box<dyn DavDirEntry>);
                         }
-
-                        // CORRECTION : Passage du cache à la résolution des métadonnées
-                        results.push(Box::new(WebDavDirEntry {
-                            name,
-                            metadata: WebDavMetaData::resolve(&entry.path(), meta, &cache),
-                        }) as Box<dyn DavDirEntry>);
                     }
-                }
-                Ok(results)
-            })
+                    Ok(results)
+                },
+            )
             .await
-            .map_err(|_| FsError::GeneralFailure)??;
+            .map_err(|_| WebDavError::ReadDirFailed)
+            .and_then(|res| res)
+            .map_err(|_| FsError::NotFound)?; // Idem, pas de log pour éviter le spam
 
             let s = stream::iter(entries.into_iter().map(Ok));
             Ok(Box::pin(s) as _)
@@ -361,10 +440,17 @@ impl DavFileSystem for WebDavFS {
     fn create_dir<'a>(&'a self, path: &'a DavPath) -> BoxFuture<'a, FsResult<()>> {
         let phys_path = self.physical_path(path);
         Box::pin(async move {
-            tokio::task::spawn_blocking(move || fs::create_dir(&phys_path))
-                .await
-                .map_err(|_| FsError::GeneralFailure)?
-                .map_err(|_| FsError::GeneralFailure)
+            tokio::task::spawn_blocking(move || -> Result<(), WebDavError> {
+                fs::create_dir(&phys_path).map_err(|_| WebDavError::CreateDirFailed)?;
+                Ok(())
+            })
+            .await
+            .map_err(|_| WebDavError::CreateDirFailed)
+            .and_then(|res| res)
+            .map_err(|e| {
+                eprintln!("{}", e);
+                FsError::GeneralFailure
+            })
         })
     }
 
@@ -372,23 +458,35 @@ impl DavFileSystem for WebDavFS {
         let phys_path = self.physical_path(path);
         let cache = self.cache.clone();
         Box::pin(async move {
-            tokio::task::spawn_blocking(move || {
+            tokio::task::spawn_blocking(move || -> Result<(), WebDavError> {
                 cache.remove(&phys_path);
-                fs::remove_file(&phys_path)
+                fs::remove_file(&phys_path).map_err(|_| WebDavError::RemoveFileFailed)?;
+                Ok(())
             })
             .await
-            .map_err(|_| FsError::GeneralFailure)?
-            .map_err(|_| FsError::GeneralFailure)
+            .map_err(|_| WebDavError::RemoveFileFailed)
+            .and_then(|res| res)
+            .map_err(|e| {
+                eprintln!("{}", e);
+                FsError::GeneralFailure
+            })
         })
     }
 
     fn remove_dir<'a>(&'a self, path: &'a DavPath) -> BoxFuture<'a, FsResult<()>> {
         let phys_path = self.physical_path(path);
         Box::pin(async move {
-            tokio::task::spawn_blocking(move || fs::remove_dir(&phys_path))
-                .await
-                .map_err(|_| FsError::GeneralFailure)?
-                .map_err(|_| FsError::GeneralFailure)
+            tokio::task::spawn_blocking(move || -> Result<(), WebDavError> {
+                fs::remove_dir(&phys_path).map_err(|_| WebDavError::RemoveDirFailed)?;
+                Ok(())
+            })
+            .await
+            .map_err(|_| WebDavError::RemoveDirFailed)
+            .and_then(|res| res)
+            .map_err(|e| {
+                eprintln!("{}", e);
+                FsError::GeneralFailure
+            })
         })
     }
 
@@ -398,15 +496,18 @@ impl DavFileSystem for WebDavFS {
         let cache = self.cache.clone();
 
         Box::pin(async move {
-            tokio::task::spawn_blocking(move || {
+            tokio::task::spawn_blocking(move || -> Result<(), WebDavError> {
                 cache.remove(&from_path);
-                fs::rename(from_path, to_path).map_err(|e| match e.kind() {
-                    io::ErrorKind::NotFound => FsError::NotFound,
-                    _ => FsError::GeneralFailure,
-                })
+                fs::rename(from_path, to_path).map_err(|_| WebDavError::RenameFailed)?;
+                Ok(())
             })
             .await
-            .map_err(|_| FsError::GeneralFailure)?
+            .map_err(|_| WebDavError::RenameFailed)
+            .and_then(|res| res)
+            .map_err(|e| {
+                eprintln!("{}", e);
+                FsError::GeneralFailure
+            })
         })
     }
 
@@ -416,18 +517,18 @@ impl DavFileSystem for WebDavFS {
         let master_key = self.master_key.clone();
 
         Box::pin(async move {
-            tokio::task::spawn_blocking(move || {
+            tokio::task::spawn_blocking(move || -> Result<(), WebDavError> {
                 let cipher_src = Aes256XtsCipher::new(master_key.clone());
                 let cipher_dst = Aes256XtsCipher::new(master_key);
 
                 let mut src_file = EncryptedFile::open(&from_path, cipher_src, false, false)
-                    .map_err(|_| FsError::NotFound)?;
+                    .map_err(|_| WebDavError::CopySrcOpenFailed)?;
                 let logical_size = src_file
                     .logical_size()
-                    .map_err(|_| FsError::GeneralFailure)?;
+                    .map_err(|_| WebDavError::CopyReadWriteFailed)?;
 
                 let mut dst_file = EncryptedFile::open(&to_path, cipher_dst, true, true)
-                    .map_err(|_| FsError::GeneralFailure)?;
+                    .map_err(|_| WebDavError::CopyDstOpenFailed)?;
 
                 let chunk_size: usize = 64 * 1024;
                 let mut offset: u64 = 0;
@@ -438,33 +539,42 @@ impl DavFileSystem for WebDavFS {
 
                     let secure_buf = src_file
                         .read_chunk(offset, current_chunk_size)
-                        .map_err(|_| FsError::GeneralFailure)?;
+                        .map_err(|_| WebDavError::CopyReadWriteFailed)?;
                     dst_file
                         .write_chunk(offset, &secure_buf.0)
-                        .map_err(|_| FsError::GeneralFailure)?;
+                        .map_err(|_| WebDavError::CopyReadWriteFailed)?;
                     offset += current_chunk_size as u64;
                 }
                 Ok(())
             })
             .await
-            .map_err(|_| FsError::GeneralFailure)?
+            .map_err(|_| WebDavError::CopyReadWriteFailed) // Arbitraire pour JoinError
+            .and_then(|res| res)
+            .map_err(|e| {
+                eprintln!("{}", e);
+                FsError::GeneralFailure
+            })
         })
     }
 
     fn get_quota(&self) -> BoxFuture<'_, FsResult<(u64, Option<u64>)>> {
         let phys_root = self.physical_root.clone();
         Box::pin(async move {
-            let result = tokio::task::spawn_blocking(move || {
+            tokio::task::spawn_blocking(move || -> Result<(u64, Option<u64>), WebDavError> {
                 let total_space = fs4::total_space(&phys_root).unwrap_or(0);
                 let available_space = fs4::available_space(&phys_root).unwrap_or(0);
-                (
+                Ok((
                     total_space.saturating_sub(available_space),
                     Some(total_space),
-                )
+                ))
             })
             .await
-            .map_err(|_| FsError::GeneralFailure)?;
-            Ok(result)
+            .map_err(|_| WebDavError::QuotaFailed)
+            .and_then(|res| res)
+            .map_err(|e| {
+                eprintln!("{}", e);
+                FsError::GeneralFailure
+            })
         })
     }
 }

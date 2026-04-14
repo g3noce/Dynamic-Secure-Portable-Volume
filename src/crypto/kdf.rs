@@ -1,11 +1,24 @@
 use crate::utils::memory::SecureKey;
 use argon2::{Algorithm, Argon2, Params, Version};
+use std::fmt;
 
 #[derive(Debug)]
 pub enum KdfError {
     DerivationFailed,
     InvalidParameters,
 }
+
+impl fmt::Display for KdfError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let cause = match self {
+            KdfError::DerivationFailed => "échec du hachage interne Argon2",
+            KdfError::InvalidParameters => "paramètres de configuration Argon2 rejetés",
+        };
+        write!(f, "mod : kdf , fonction : derive_key , cause : {}", cause)
+    }
+}
+
+impl std::error::Error for KdfError {}
 
 pub trait KeyDerivation {
     fn derive_key(password: &str, salt: &[u8]) -> Result<SecureKey, KdfError>;
@@ -18,7 +31,6 @@ impl KeyDerivation for Argon2Kdf {
         let params = Params::new(65536, 3, 4, Some(64)).map_err(|_| KdfError::InvalidParameters)?;
         let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
 
-        // 64 octets obligatoires pour AES-256-XTS (Clé 1 + Clé 2)
         let mut key_m = vec![0u8; 64];
         argon2
             .hash_password_into(password.as_bytes(), salt, &mut key_m)

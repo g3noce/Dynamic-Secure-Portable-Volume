@@ -1,10 +1,32 @@
 use dashmap::DashMap;
+use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use crate::crypto::cipher::Aes256XtsCipher;
 use crate::storage::chunk_io::EncryptedFile;
+
+// --- AJOUT : Énumération structurée pour les erreurs personnalisées ---
+#[derive(Debug)]
+pub enum CacheError {
+    FileOpenFailed,
+}
+
+impl fmt::Display for CacheError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (func, cause) = match self {
+            CacheError::FileOpenFailed => (
+                "get_or_open",
+                "échec de l'ouverture ou création du fichier chiffré",
+            ),
+        };
+        write!(f, "mod : cache , fonction : {} , cause : {}", func, cause)
+    }
+}
+
+impl std::error::Error for CacheError {}
+// ----------------------------------------------------------------------
 
 pub struct FileCache {
     entries: DashMap<PathBuf, Arc<Mutex<EncryptedFile<Aes256XtsCipher>>>>,
@@ -34,7 +56,9 @@ impl FileCache {
             return Ok(entry.value().clone());
         }
 
-        let file = EncryptedFile::open(path, cipher, truncate, write_access)?;
+        let file = EncryptedFile::open(path, cipher, truncate, write_access)
+            .map_err(|e| io::Error::new(e.kind(), CacheError::FileOpenFailed))?;
+
         let shared_file = Arc::new(Mutex::new(file));
 
         self.entries.insert(path_buf.clone(), shared_file.clone());

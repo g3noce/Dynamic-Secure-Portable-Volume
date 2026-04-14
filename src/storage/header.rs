@@ -1,9 +1,44 @@
 use rand::Rng;
+use std::fmt;
 use std::io::{self, Read, Write};
 
 pub const HEADER_SIZE: u64 = 32;
 // L'IV fait 16 octets, donc la taille logique commence exactement à l'octet 16.
 pub const LOGICAL_SIZE_OFFSET: u64 = 16;
+
+// --- AJOUT : Énumération structurée pour les erreurs personnalisées ---
+#[derive(Debug)]
+pub enum HeaderError {
+    ReadIvFailed,
+    ReadSizeFailed,
+    ReadReservedFailed,
+    WriteIvFailed,
+    WriteSizeFailed,
+    WriteReservedFailed,
+}
+
+impl fmt::Display for HeaderError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (func, cause) = match self {
+            HeaderError::ReadIvFailed => ("read_from", "lecture de l'IV impossible"),
+            HeaderError::ReadSizeFailed => ("read_from", "lecture de la taille logique impossible"),
+            HeaderError::ReadReservedFailed => {
+                ("read_from", "lecture de la zone réservée impossible")
+            }
+            HeaderError::WriteIvFailed => ("write_to", "écriture de l'IV impossible"),
+            HeaderError::WriteSizeFailed => {
+                ("write_to", "écriture de la taille logique impossible")
+            }
+            HeaderError::WriteReservedFailed => {
+                ("write_to", "écriture de la zone réservée impossible")
+            }
+        };
+        write!(f, "mod : header , fonction : {} , cause : {}", func, cause)
+    }
+}
+
+impl std::error::Error for HeaderError {}
+// ----------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
 pub struct FileHeader {
@@ -25,13 +60,19 @@ impl FileHeader {
 
     pub fn read_from<R: Read>(mut reader: R) -> io::Result<Self> {
         let mut iv = [0u8; 16];
-        reader.read_exact(&mut iv)?;
+        reader
+            .read_exact(&mut iv)
+            .map_err(|e| io::Error::new(e.kind(), HeaderError::ReadIvFailed))?;
 
         let mut size_bytes = [0u8; 8];
-        reader.read_exact(&mut size_bytes)?;
+        reader
+            .read_exact(&mut size_bytes)
+            .map_err(|e| io::Error::new(e.kind(), HeaderError::ReadSizeFailed))?;
 
         let mut reserved = [0u8; 8];
-        reader.read_exact(&mut reserved)?;
+        reader
+            .read_exact(&mut reserved)
+            .map_err(|e| io::Error::new(e.kind(), HeaderError::ReadReservedFailed))?;
 
         Ok(Self {
             iv,
@@ -41,9 +82,15 @@ impl FileHeader {
     }
 
     pub fn write_to<W: Write>(&self, mut writer: W) -> io::Result<()> {
-        writer.write_all(&self.iv)?;
-        writer.write_all(&self.logical_size.to_le_bytes())?;
-        writer.write_all(&self.reserved)?;
+        writer
+            .write_all(&self.iv)
+            .map_err(|e| io::Error::new(e.kind(), HeaderError::WriteIvFailed))?;
+        writer
+            .write_all(&self.logical_size.to_le_bytes())
+            .map_err(|e| io::Error::new(e.kind(), HeaderError::WriteSizeFailed))?;
+        writer
+            .write_all(&self.reserved)
+            .map_err(|e| io::Error::new(e.kind(), HeaderError::WriteReservedFailed))?;
         Ok(())
     }
 }

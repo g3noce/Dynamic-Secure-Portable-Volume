@@ -1,4 +1,5 @@
 use rand::Rng;
+use std::fmt;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::Path;
@@ -10,6 +11,39 @@ use crate::utils::memory::SecureKey;
 const VAULT_MAGIC: &[u8; 4] = b"DSPM";
 const SALT_SIZE: usize = 32;
 const VERIFY_BLOCK_SIZE: usize = 32;
+
+// --- AJOUT : Énumération structurée pour les erreurs personnalisées ---
+#[derive(Debug)]
+pub enum VaultError {
+    KdfFailedCreate,
+    EncryptVerifyFailed,
+    InvalidMagic,
+    KdfFailedUnlock,
+    DecryptVerifyFailed,
+    WrongPassword,
+}
+
+impl fmt::Display for VaultError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (func, cause) = match self {
+            VaultError::KdfFailedCreate => ("create_new", "échec KDF"),
+            VaultError::EncryptVerifyFailed => {
+                ("create_new", "échec du chiffrement du bloc de vérification")
+            }
+            VaultError::InvalidMagic => ("unlock_existing", "fichier meta corrompu ou invalide"),
+            VaultError::KdfFailedUnlock => ("unlock_existing", "échec KDF"),
+            VaultError::DecryptVerifyFailed => (
+                "unlock_existing",
+                "échec du déchiffrement du bloc de vérification",
+            ),
+            VaultError::WrongPassword => ("unlock_existing", "mot de passe incorrect"),
+        };
+        write!(f, "mod : vault , fonction : {} , cause : {}", func, cause)
+    }
+}
+
+impl std::error::Error for VaultError {}
+// ----------------------------------------------------------------------
 
 pub struct VaultManager;
 
@@ -31,8 +65,8 @@ impl VaultManager {
         let mut salt = [0u8; SALT_SIZE];
         rand::rng().fill_bytes(&mut salt);
 
-        let master_key =
-            Argon2Kdf::derive_key(password, &salt).map_err(|_| io::Error::other("Échec KDF"))?;
+        let master_key = Argon2Kdf::derive_key(password, &salt)
+            .map_err(|_| io::Error::other(VaultError::KdfFailedCreate))?;
 
         let mut verify_block = [0u8; VERIFY_BLOCK_SIZE];
         let meta_iv = [0u8; 16];
@@ -40,7 +74,7 @@ impl VaultManager {
 
         cipher
             .encrypt_chunk(&meta_iv, 0, &mut verify_block)
-            .map_err(|_| io::Error::other("Échec chiffrement bloc vérification"))?;
+            .map_err(|_| io::Error::other(VaultError::EncryptVerifyFailed))?;
 
         let mut file = File::create(meta_path)?;
         file.write_all(VAULT_MAGIC)?;
@@ -57,7 +91,7 @@ impl VaultManager {
         let mut magic = [0u8; 4];
         file.read_exact(&mut magic)?;
         if &magic != VAULT_MAGIC {
-            return Err(io::Error::other("Fichier meta corrompu ou invalide"));
+            return Err(io::Error::other(VaultError::InvalidMagic));
         }
 
         let mut salt = [0u8; SALT_SIZE];
@@ -66,18 +100,18 @@ impl VaultManager {
         let mut verify_block = [0u8; VERIFY_BLOCK_SIZE];
         file.read_exact(&mut verify_block)?;
 
-        let master_key =
-            Argon2Kdf::derive_key(password, &salt).map_err(|_| io::Error::other("Échec KDF"))?;
+        let master_key = Argon2Kdf::derive_key(password, &salt)
+            .map_err(|_| io::Error::other(VaultError::KdfFailedUnlock))?;
 
         let cipher = Aes256XtsCipher::new(master_key.clone());
         let meta_iv = [0u8; 16];
 
         cipher
             .decrypt_chunk(&meta_iv, 0, &mut verify_block)
-            .map_err(|_| io::Error::other("Échec déchiffrement bloc vérification"))?;
+            .map_err(|_| io::Error::other(VaultError::DecryptVerifyFailed))?;
 
         if verify_block != [0u8; VERIFY_BLOCK_SIZE] {
-            return Err(io::Error::other("Mot de passe incorrect"));
+            return Err(io::Error::other(VaultError::WrongPassword));
         }
 
         Ok(master_key)
@@ -132,7 +166,11 @@ mod tests {
             result.is_err(),
             "CRITICAL: Le système a accepté un mauvais mot de passe !"
         );
-        assert_eq!(result.unwrap_err().to_string(), "Mot de passe incorrect");
+        // MODIFICATION ICI : Adaptation à ta nouvelle convention de message d'erreur
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "mod : vault , fonction : unlock_existing , cause : mot de passe incorrect"
+        );
 
         teardown_test_env(&root);
     }

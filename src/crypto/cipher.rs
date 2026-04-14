@@ -1,6 +1,7 @@
 use crate::utils::memory::SecureKey;
 use aes::cipher::KeyInit;
 use aes::Aes256;
+use std::fmt;
 use xts_mode::{get_tweak_default, Xts128};
 
 #[derive(Debug)]
@@ -8,6 +9,24 @@ pub enum CipherError {
     InitializationFailed,
     AlignmentError,
 }
+
+impl fmt::Display for CipherError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let cause = match self {
+            CipherError::InitializationFailed => {
+                "taille de clé (doit être 64) ou IV (doit être 16) invalide"
+            }
+            CipherError::AlignmentError => "les données ne sont pas un multiple de 16 octets",
+        };
+        write!(
+            f,
+            "mod : cipher , fonction : traitement_chunk , cause : {}",
+            cause
+        )
+    }
+}
+
+impl std::error::Error for CipherError {}
 
 pub trait ChunkCipher {
     fn new(key: SecureKey) -> Self;

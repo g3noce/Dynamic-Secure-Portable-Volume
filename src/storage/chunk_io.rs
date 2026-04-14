@@ -1,3 +1,4 @@
+use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -7,6 +8,37 @@ use crate::storage::header::{FileHeader, HEADER_SIZE, LOGICAL_SIZE_OFFSET};
 use crate::utils::memory::SecureBuffer;
 
 const XTS_BLOCK_SIZE: u64 = 16;
+
+// --- AJOUT : Énumération structurée pour les erreurs personnalisées ---
+#[derive(Debug)]
+pub enum ChunkIoError {
+    InitReadOnly,
+    XtsDecryptionFailed,
+    RmwDecryptionFailed,
+    RmwEncryptionFailed,
+}
+
+impl fmt::Display for ChunkIoError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (func, cause) = match self {
+            ChunkIoError::InitReadOnly => (
+                "open",
+                "impossible d'initialiser un header en mode lecture seule",
+            ),
+            ChunkIoError::XtsDecryptionFailed => ("read_chunk", "échec du déchiffrement XTS"),
+            ChunkIoError::RmwDecryptionFailed => ("write_chunk", "échec du déchiffrement RMW"),
+            ChunkIoError::RmwEncryptionFailed => ("write_chunk", "échec du chiffrement RMW"),
+        };
+        write!(
+            f,
+            "mod : chunk_io , fonction : {} , cause : {}",
+            func, cause
+        )
+    }
+}
+
+impl std::error::Error for ChunkIoError {}
+// ----------------------------------------------------------------------
 
 pub struct EncryptedFile<C: ChunkCipher> {
     file: File,
@@ -34,9 +66,7 @@ impl<C: ChunkCipher> EncryptedFile<C> {
 
         let header = if metadata.len() == 0 || truncate {
             if !write_access {
-                return Err(io::Error::other(
-                    "Impossible d'initialiser un header en mode lecture seule",
-                ));
+                return Err(io::Error::other(ChunkIoError::InitReadOnly));
             }
             file.set_len(0)?;
             let new_header = FileHeader::generate_new();
@@ -81,7 +111,7 @@ impl<C: ChunkCipher> EncryptedFile<C> {
                     align_start,
                     &mut block_buffer.0[..valid_crypt_size],
                 )
-                .map_err(|_| io::Error::other("Échec du déchiffrement XTS"))?;
+                .map_err(|_| io::Error::other(ChunkIoError::XtsDecryptionFailed))?;
         }
 
         let relative_start = (logical_offset - align_start) as usize;
@@ -134,7 +164,7 @@ impl<C: ChunkCipher> EncryptedFile<C> {
                         align_start,
                         &mut block_buffer.0[..valid_blocks_size],
                     )
-                    .map_err(|_| io::Error::other("Échec déchiffrement RMW"))?;
+                    .map_err(|_| io::Error::other(ChunkIoError::RmwDecryptionFailed))?;
             }
         }
 
@@ -143,7 +173,7 @@ impl<C: ChunkCipher> EncryptedFile<C> {
 
         self.cipher
             .encrypt_chunk(&self.header.iv, align_start, &mut block_buffer.0)
-            .map_err(|_| io::Error::other("Échec chiffrement RMW"))?;
+            .map_err(|_| io::Error::other(ChunkIoError::RmwEncryptionFailed))?;
 
         let physical_offset = HEADER_SIZE + align_start;
         self.file.seek(SeekFrom::Start(physical_offset))?;
