@@ -3,8 +3,8 @@ name: Build Release Binaries
 on:
   push:
     tags:
-      - 'v*' # Se lance quand vous créez un tag type "v1.0"
-
+      - 'v*'
+      - 'latest*'
 jobs:
   build:
     name: Build on ${{ matrix.os }}
