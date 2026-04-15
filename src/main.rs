@@ -67,16 +67,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n[+] Serveur en ligne sur http://127.0.0.1:8080/");
     println!("[*] Appuyez sur CTRL+C pour quitter proprement.");
 
-    // Déclenchement de la connexion réseau (Asynchrone)
-    tokio::task::spawn(async {
-        // Pause d'une seconde pour s'assurer que le serveur est prêt
-        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
-        println!("[*] Ouverture de la connexion réseau...");
-
-        if let Err(e) = crate::os::open_connection(8080) {
-            eprintln!("[!] Note : {}", e);
-        }
-    });
+    if let Err(e) = crate::os::open_connection(8080) {
+        eprintln!("[!] Note : {}", e);
+    }
 
     loop {
         tokio::select! {
