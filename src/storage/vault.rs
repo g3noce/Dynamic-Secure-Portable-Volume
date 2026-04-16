@@ -12,7 +12,7 @@ const VAULT_MAGIC: &[u8; 4] = b"DSPM";
 const SALT_SIZE: usize = 32;
 const VERIFY_BLOCK_SIZE: usize = 32;
 
-// --- AJOUT : Énumération structurée pour les erreurs personnalisées ---
+// --- ADDITION: Structured enum for custom errors ---
 #[derive(Debug)]
 pub enum VaultError {
     KdfFailedCreate,
@@ -26,19 +26,18 @@ pub enum VaultError {
 impl fmt::Display for VaultError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let (func, cause) = match self {
-            VaultError::KdfFailedCreate => ("create_new", "échec KDF"),
+            VaultError::KdfFailedCreate => ("create_new", "KDF failed"),
             VaultError::EncryptVerifyFailed => {
-                ("create_new", "échec du chiffrement du bloc de vérification")
+                ("create_new", "failed to encrypt verification block")
             }
-            VaultError::InvalidMagic => ("unlock_existing", "fichier meta corrompu ou invalide"),
-            VaultError::KdfFailedUnlock => ("unlock_existing", "échec KDF"),
-            VaultError::DecryptVerifyFailed => (
-                "unlock_existing",
-                "échec du déchiffrement du bloc de vérification",
-            ),
-            VaultError::WrongPassword => ("unlock_existing", "mot de passe incorrect"),
+            VaultError::InvalidMagic => ("unlock_existing", "corrupt or invalid meta file"),
+            VaultError::KdfFailedUnlock => ("unlock_existing", "KDF failed"),
+            VaultError::DecryptVerifyFailed => {
+                ("unlock_existing", "failed to decrypt verification block")
+            }
+            VaultError::WrongPassword => ("unlock_existing", "incorrect password"),
         };
-        write!(f, "mod : vault , fonction : {} , cause : {}", func, cause)
+        write!(f, "mod: vault, function: {}, cause: {}", func, cause)
     }
 }
 
@@ -135,26 +134,26 @@ mod tests {
         let _ = fs::remove_dir_all(name);
     }
 
-    /// TEST 1 : Le cycle de vie normal (Création et Déverrouillage valide)
+    /// TEST 1: Normal lifecycle (Valid creation and unlock)
     #[test]
     fn test_vault_lifecycle_success() {
         let root = setup_test_env("test_vault_lifecycle");
         let password = "super_secure_password_123!";
 
-        // 1. Création
-        let key_1 = VaultManager::unlock_or_create(&root, password).expect("Création échouée");
+        // 1. Creation
+        let key_1 = VaultManager::unlock_or_create(&root, password).expect("Creation failed");
         assert!(Path::new(&root).join("dspv.meta").exists());
 
-        // 2. Déverrouillage
-        let key_2 = VaultManager::unlock_or_create(&root, password).expect("Déverrouillage échoué");
+        // 2. Unlock
+        let key_2 = VaultManager::unlock_or_create(&root, password).expect("Unlock failed");
 
-        // La clé en RAM doit être strictement identique
-        assert_eq!(key_1.0, key_2.0, "Les clés dérivées ne correspondent pas !");
+        // The key in RAM must be strictly identical
+        assert_eq!(key_1.0, key_2.0, "Derived keys do not match!");
 
         teardown_test_env(&root);
     }
 
-    /// TEST 2 : Le rejet stricte d'un mauvais mot de passe
+    /// TEST 2: Strict rejection of a wrong password
     #[test]
     fn test_vault_wrong_password() {
         let root = setup_test_env("test_vault_wrong_pwd");
@@ -164,25 +163,25 @@ mod tests {
 
         assert!(
             result.is_err(),
-            "CRITICAL: Le système a accepté un mauvais mot de passe !"
+            "CRITICAL: The system accepted a wrong password!"
         );
-        // MODIFICATION ICI : Adaptation à ta nouvelle convention de message d'erreur
+        // MODIFICATION HERE: Adapted to the new error message convention
         assert_eq!(
             result.unwrap_err().to_string(),
-            "mod : vault , fonction : unlock_existing , cause : mot de passe incorrect"
+            "mod: vault, function: unlock_existing, cause: incorrect password"
         );
 
         teardown_test_env(&root);
     }
 
-    /// TEST 3 : Résilience face à un fichier tronqué (Short Read)
-    /// Empêche le programme de paniquer si le fichier meta fait moins de 68 octets.
+    /// TEST 3: Resilience against a truncated file (Short Read)
+    /// Prevents the program from panicking if the meta file is less than 68 bytes.
     #[test]
     fn test_vault_truncated_file_no_panic() {
         let root = setup_test_env("test_vault_truncated");
         let meta_path = Path::new(&root).join("dspv.meta");
 
-        // On forge un fichier avec seulement le Magic Number et un bout de sel (10 octets au total)
+        // Forge a file with only the Magic Number and part of the salt (10 bytes total)
         let mut file = File::create(&meta_path).unwrap();
         file.write_all(b"DSPM").unwrap();
         file.write_all(&[0x42; 6]).unwrap();
@@ -190,21 +189,18 @@ mod tests {
 
         let result = VaultManager::unlock_or_create(&root, "password");
 
-        assert!(
-            result.is_err(),
-            "Le système doit rejeter un fichier tronqué"
-        );
+        assert!(result.is_err(), "The system must reject a truncated file");
         assert_eq!(
             result.unwrap_err().kind(),
             io::ErrorKind::UnexpectedEof,
-            "L'erreur doit être UnexpectedEof (fin de fichier prématurée), pas un crash système"
+            "The error must be UnexpectedEof (premature end of file), not a system crash"
         );
 
         teardown_test_env(&root);
     }
 
-    /// TEST 4 : Tentative de falsification du Sel (Salt Tampering)
-    /// Modifier 1 seul octet du sel doit altérer le résultat du KDF et rejeter l'accès.
+    /// TEST 4: Attempted Salt Tampering
+    /// Modifying even 1 byte of the salt should alter the KDF result and reject access.
     #[test]
     fn test_vault_salt_tampering() {
         let root = setup_test_env("test_vault_salt_tamper");
@@ -213,10 +209,10 @@ mod tests {
 
         VaultManager::unlock_or_create(&root, password).unwrap();
 
-        // Ouverture en mode modification binaire
+        // Open in binary write mode
         let mut file = OpenOptions::new().write(true).open(&meta_path).unwrap();
 
-        // Le sel commence à l'offset 4 (après "DSPM"). On modifie l'octet à l'offset 10.
+        // The salt starts at offset 4 (after "DSPM"). We modify the byte at offset 10.
         file.seek(SeekFrom::Start(10)).unwrap();
         file.write_all(&[0xFF]).unwrap();
         drop(file);
@@ -225,15 +221,15 @@ mod tests {
 
         assert!(
             result.is_err(),
-            "CRITICAL: La modification du sel n'a pas invalidé le coffre !"
+            "CRITICAL: Tampering with the salt did not invalidate the vault!"
         );
 
         teardown_test_env(&root);
     }
 
-    /// TEST 5 : Tentative de falsification du bloc de vérification chiffré
-    /// Si un attaquant modifie la signature chiffrée, le déchiffrement donnera
-    /// un résultat différent de [0; 32] et l'accès doit être bloqué.
+    /// TEST 5: Attempted verification block tampering
+    /// If an attacker modifies the encrypted signature, decryption will yield
+    /// a result different from [0; 32] and access must be blocked.
     #[test]
     fn test_vault_verify_block_tampering() {
         let root = setup_test_env("test_vault_block_tamper");
@@ -244,7 +240,7 @@ mod tests {
 
         let mut file = OpenOptions::new().write(true).open(&meta_path).unwrap();
 
-        // Le bloc de vérification commence à l'offset 36 (4 Magic + 32 Sel).
+        // The verification block starts at offset 36 (4 Magic + 32 Salt).
         file.seek(SeekFrom::Start(40)).unwrap();
         file.write_all(&[0xFF]).unwrap();
         drop(file);
@@ -253,14 +249,14 @@ mod tests {
 
         assert!(
             result.is_err(),
-            "CRITICAL: Le coffre s'est ouvert malgré un bloc de vérification corrompu !"
+            "CRITICAL: The vault opened despite a corrupted verification block!"
         );
 
         teardown_test_env(&root);
     }
 
-    /// TEST 6 : Gestion d'un mot de passe vide
-    /// Vérifie que l'algorithme KDF (Argon2) est capable d'ingérer une chaîne vide proprement.
+    /// TEST 6: Handling an empty password
+    /// Verifies that the KDF algorithm (Argon2) can cleanly ingest an empty string.
     #[test]
     fn test_vault_empty_password_handling() {
         let root = setup_test_env("test_vault_empty_pwd");
@@ -268,13 +264,13 @@ mod tests {
         let result_create = VaultManager::unlock_or_create(&root, "");
         assert!(
             result_create.is_ok(),
-            "Le système doit pouvoir gérer un mot de passe vide sans planter"
+            "The system must handle an empty password without crashing"
         );
 
         let result_unlock = VaultManager::unlock_or_create(&root, "");
         assert!(
             result_unlock.is_ok(),
-            "Le système doit pouvoir déverrouiller avec un mot de passe vide"
+            "The system must unlock with an empty password"
         );
 
         teardown_test_env(&root);

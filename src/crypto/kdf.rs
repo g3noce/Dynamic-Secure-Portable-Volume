@@ -11,10 +11,10 @@ pub enum KdfError {
 impl fmt::Display for KdfError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let cause = match self {
-            KdfError::DerivationFailed => "échec du hachage interne Argon2",
-            KdfError::InvalidParameters => "paramètres de configuration Argon2 rejetés",
+            KdfError::DerivationFailed => "Argon2 internal hashing failed",
+            KdfError::InvalidParameters => "Argon2 configuration parameters rejected",
         };
-        write!(f, "mod : kdf , fonction : derive_key , cause : {}", cause)
+        write!(f, "mod: kdf, function: derive_key, cause: {}", cause)
     }
 }
 
@@ -46,44 +46,44 @@ mod tests {
 
     // --- Helpers ---
     fn get_dummy_salt() -> [u8; 16] {
-        [0u8; 16] // Sel constant pour tests de reproductibilité
+        [0u8; 16] // Constant salt for reproducibility tests
     }
 
-    /// TEST 1 : Stabilité et Déterminisme (Vecteur de test)
-    /// Garantit que les paramètres (64Mo, 3 itérations, 4 threads) ne changent jamais par erreur.
+    /// TEST 1: Stability and Determinism (Test Vector)
+    /// Guarantees that the parameters (64MB, 3 iterations, 4 threads) never change by mistake.
     #[test]
     fn test_kdf_parameters_stability() {
         let password = "dspv_test_password";
-        let salt = b"static_salt_1234"; // 16 octets
+        let salt = b"static_salt_1234"; // 16 bytes
 
         let key1 = Argon2Kdf::derive_key(password, salt).unwrap();
         let key2 = Argon2Kdf::derive_key(password, salt).unwrap();
 
-        // 1. Déterminisme
-        assert_eq!(key1.0, key2.0, "Le KDF n'est pas déterministe !");
+        // 1. Determinism
+        assert_eq!(key1.0, key2.0, "The KDF is not deterministic!");
 
-        // 2. Taille de sortie (Crucial pour AES-256-XTS)
+        // 2. Output size (Crucial for AES-256-XTS)
         assert_eq!(
             key1.0.len(),
             64,
-            "La clé doit faire exactement 64 octets (2x256 bits)"
+            "The key must be exactly 64 bytes (2x256 bits)"
         );
     }
 
-    /// TEST 2 : Effet Avalanche (Sensibilité extrême)
-    /// Un changement d'un seul bit doit produire une clé totalement différente.
+    /// TEST 2: Avalanche Effect (Extreme Sensitivity)
+    /// Changing a single bit must produce a completely different key.
     #[test]
     fn test_kdf_avalanche_effect() {
         let salt = get_dummy_salt();
         let pwd1 = "MotDePasse123!";
-        let pwd2 = "MotDePasse123?"; // Juste le dernier caractère change
+        let pwd2 = "MotDePasse123?"; // Only the last character changes
 
         let key1 = Argon2Kdf::derive_key(pwd1, &salt).unwrap();
         let key2 = Argon2Kdf::derive_key(pwd2, &salt).unwrap();
 
         assert_ne!(key1.0, key2.0);
 
-        // Optionnel : vérifier qu'on n'a pas juste un octet de différence
+        // Optional: verify that we don't just have a one-byte difference
         let mut diff_count = 0;
         for i in 0..64 {
             if key1.0[i] != key2.0[i] {
@@ -92,43 +92,43 @@ mod tests {
         }
         assert!(
             diff_count > 50,
-            "L'effet avalanche est trop faible (faiblesse cryptographique)"
+            "The avalanche effect is too weak (cryptographic weakness)"
         );
     }
 
-    /// TEST 3 : Gestion des cas limites (Mot de passe vide / long)
+    /// TEST 3: Handling edge cases (Empty / Long password)
     #[test]
     fn test_kdf_edge_cases_passwords() {
         let salt = get_dummy_salt();
 
-        // Mot de passe vide (doit fonctionner mais produire une clé forte)
+        // Empty password (must work but produce a strong key)
         let key_empty = Argon2Kdf::derive_key("", &salt);
         assert!(key_empty.is_ok());
         assert_eq!(key_empty.unwrap().0.len(), 64);
 
-        // Mot de passe très long (plusieurs Ko)
+        // Very long password (several KB)
         let long_pwd = "A".repeat(10000);
         let key_long = Argon2Kdf::derive_key(&long_pwd, &salt);
         assert!(key_long.is_ok());
     }
 
-    /// TEST 4 : Sécurité du Sel (Taille minimale)
-    /// Argon2id nécessite un sel d'au moins 8 octets.
+    /// TEST 4: Salt Security (Minimum size)
+    /// Argon2id requires a salt of at least 8 bytes.
     #[test]
     fn test_kdf_salt_security_limits() {
         let pwd = "password";
 
-        // Sel trop court (6 octets)
+        // Salt too short (6 bytes)
         let short_salt = b"123456";
         let result = Argon2Kdf::derive_key(pwd, short_salt);
 
         assert!(
             result.is_err(),
-            "Le KDF devrait échouer avec un sel de moins de 8 octets"
+            "The KDF should fail with a salt of less than 8 bytes"
         );
     }
 
-    /// TEST 5 : Non-réutilisation (Unique Salt = Unique Key)
+    /// TEST 5: Non-reuse (Unique Salt = Unique Key)
     #[test]
     fn test_kdf_salt_uniqueness() {
         let pwd = "same_password";
@@ -140,7 +140,7 @@ mod tests {
 
         assert_ne!(
             key1.0, key2.0,
-            "Deux sels différents doivent produire des clés différentes"
+            "Two different salts must produce different keys"
         );
     }
 }

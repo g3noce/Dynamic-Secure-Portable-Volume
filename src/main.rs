@@ -36,19 +36,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if !std::path::Path::new(&physical_root).exists() {
         std::fs::create_dir_all(&physical_root)?;
-        println!("[+] Dossier physique créé : {}", physical_root);
+        println!("[+] Physical folder created: {}", physical_root);
     }
 
-    let password = rpassword::prompt_password("Clé de chiffrement du volume : ")?;
+    let password = rpassword::prompt_password("Volume encryption key: ")?;
     let password = password.trim();
 
-    println!("[*] Déverrouillage du volume...");
+    println!("[*] Unlocking volume...");
 
     let master_key =
         match crate::storage::vault::VaultManager::unlock_or_create(&physical_root, password) {
             Ok(key) => key,
             Err(e) => {
-                eprintln!("\n[!] ERREUR : {}", e);
+                eprintln!("\n[!] ERROR: {}", e);
                 std::process::exit(1);
             }
         };
@@ -64,11 +64,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = SocketAddr::from(([127, 0, 0, 1], 8080));
     let listener = TcpListener::bind(addr).await?;
 
-    println!("\n[+] Serveur en ligne sur http://127.0.0.1:8080/");
-    println!("[*] Appuyez sur CTRL+C pour quitter proprement.");
+    println!("\n[+] Server online at http://127.0.0.1:8080/");
+    println!("[*] Press CTRL+C to exit cleanly.");
 
     if let Err(e) = crate::os::open_connection(8080) {
-        eprintln!("[!] Note : {}", e);
+        eprintln!("[!] Note: {}", e);
     }
 
     loop {
@@ -86,20 +86,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             });
 
                             if let Err(err) = http1::Builder::new().serve_connection(io, service).await {
-                                eprintln!("[!] Erreur connexion : {:?}", err);
+                                eprintln!("[!] Connection error: {:?}", err);
                             }
                         });
                     }
-                    Err(e) => eprintln!("[!] Erreur acceptation : {}", e),
+                    Err(e) => eprintln!("[!] Acceptance error: {}", e),
                 }
             }
             _ = signal::ctrl_c() => {
-                println!("\n[!] Arrêt demandé.");
+                println!("\n[!] Shutdown requested.");
 
-                println!("[*] Fermeture de la connexion réseau...");
+                println!("[*] Closing network connection...");
                 let _ = crate::os::close_connection(8080);
 
-                println!("[*] Synchronisation finale des fichiers en cours...");
+                println!("[*] Finalizing file synchronization...");
                 file_cache.flush_all();
 
                 break;
@@ -107,6 +107,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    println!("[+] Volume déconnecté et RAM purgée.");
+    println!("[+] Volume disconnected and RAM purged.");
     Ok(())
 }

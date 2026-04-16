@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use crate::crypto::cipher::Aes256XtsCipher;
 use crate::storage::chunk_io::EncryptedFile;
 
-// --- AJOUT : Énumération structurée pour les erreurs personnalisées ---
+// --- ADDITION: Structured enum for custom errors ---
 #[derive(Debug)]
 pub enum CacheError {
     FileOpenFailed,
@@ -16,12 +16,11 @@ pub enum CacheError {
 impl fmt::Display for CacheError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let (func, cause) = match self {
-            CacheError::FileOpenFailed => (
-                "get_or_open",
-                "échec de l'ouverture ou création du fichier chiffré",
-            ),
+            CacheError::FileOpenFailed => {
+                ("get_or_open", "failed to open or create encrypted file")
+            }
         };
-        write!(f, "mod : cache , fonction : {} , cause : {}", func, cause)
+        write!(f, "mod: cache, function: {}, cause: {}", func, cause)
     }
 }
 
@@ -94,45 +93,45 @@ mod tests {
     use crate::utils::memory::SecureKey;
 
     // --- Helper ---
-    // Génère un chiffreur factice valide pour les tests I/O
+    // Generates a valid dummy cipher for I/O tests
     fn dummy_cipher() -> Aes256XtsCipher {
         Aes256XtsCipher::new(SecureKey(vec![0x42; 64]))
     }
 
-    /// TEST 1 : Vérification de la mécanique de Singleton (Égalité des pointeurs)
-    /// L'OS peut demander à ouvrir le même fichier 10 fois. Le cache DOIT renvoyer
-    /// exactement la même instance mémoire pour éviter la corruption (Access Denied).
+    /// TEST 1: Verifying Singleton mechanics (Pointer equality)
+    /// The OS might request to open the same file 10 times. The cache MUST return
+    /// the exact same memory instance to avoid corruption (Access Denied).
     #[test]
     fn test_cache_singleton_behavior() {
         let cache = FileCache::new();
         let path = PathBuf::from("test_cache_singleton.enc");
         let _ = fs::remove_file(&path);
 
-        // Première ouverture
+        // First open
         let file1 = cache
             .get_or_open(&path, dummy_cipher(), true, true)
-            .expect("Échec ouverture 1");
+            .expect("Open failed 1");
 
-        // Deuxième ouverture du MÊME fichier (sans truncate)
+        // Second open of the SAME file (without truncate)
         let file2 = cache
             .get_or_open(&path, dummy_cipher(), false, true)
-            .expect("Échec ouverture 2");
+            .expect("Open failed 2");
 
-        // ASSERTION CRITIQUE : file1 et file2 DOIVENT pointer vers la même adresse mémoire
+        // CRITICAL ASSERTION: file1 and file2 MUST point to the same memory address
         assert!(
             Arc::ptr_eq(&file1, &file2),
-            "FAIL: Le cache a créé deux instances distinctes pour le même fichier !"
+            "FAIL: The cache created two distinct instances for the same file!"
         );
 
-        // Il ne doit y avoir qu'une seule entrée dans le DashMap
+        // There should be only one entry in the DashMap
         assert_eq!(cache.entries.len(), 1);
 
         let _ = fs::remove_file(&path);
     }
 
-    /// TEST 2 : Comportement du mode Truncate (Éviction forcée)
-    /// Si Windows demande d'écraser un fichier (Truncate), le cache doit détruire
-    /// l'ancienne référence en RAM et en rouvrir une nouvelle propre.
+    /// TEST 2: Truncate mode behavior (Forced eviction)
+    /// If Windows requests to overwrite a file (Truncate), the cache must destroy
+    /// the old reference in RAM and open a fresh new one.
     #[test]
     fn test_cache_truncate_forces_eviction() {
         let cache = FileCache::new();
@@ -143,60 +142,60 @@ mod tests {
             .get_or_open(&path, dummy_cipher(), true, true)
             .unwrap();
 
-        // On rouvre le fichier avec `truncate = true`
+        // Reopen the file with `truncate = true`
         let file_new = cache
             .get_or_open(&path, dummy_cipher(), true, true)
             .unwrap();
 
-        // ASSERTION CRITIQUE : les pointeurs doivent être DIFFÉRENTS cette fois-ci
+        // CRITICAL ASSERTION: the pointers must be DIFFERENT this time
         assert!(
             !Arc::ptr_eq(&file_old, &file_new),
-            "FAIL: Le mode truncate n'a pas évincé l'ancienne instance du cache !"
+            "FAIL: Truncate mode did not evict the old instance from the cache!"
         );
 
         let _ = fs::remove_file(&path);
     }
 
-    /// TEST 3 : Cycle de vie passif (get_cached) et suppression (remove)
+    /// TEST 3: Passive lifecycle (get_cached) and removal (remove)
     #[test]
     fn test_cache_passive_read_and_remove() {
         let cache = FileCache::new();
         let path = PathBuf::from("test_cache_lifecycle.enc");
         let _ = fs::remove_file(&path);
 
-        // 1. Avant création, le cache doit renvoyer None sans I/O
+        // 1. Before creation, the cache should return None without I/O
         assert!(cache.get_cached(&path).is_none());
 
-        // 2. Création
+        // 2. Creation
         let _ = cache
             .get_or_open(&path, dummy_cipher(), true, true)
             .unwrap();
 
-        // 3. get_cached doit maintenant renvoyer Some (le fichier est en RAM)
+        // 3. get_cached should now return Some (the file is in RAM)
         assert!(
             cache.get_cached(&path).is_some(),
-            "FAIL: get_cached n'a pas trouvé le fichier fraîchement créé"
+            "FAIL: get_cached did not find the freshly created file"
         );
 
-        // 4. Suppression explicite
+        // 4. Explicit removal
         cache.remove(&path);
         assert!(
             cache.get_cached(&path).is_none(),
-            "FAIL: remove() n'a pas purgé le fichier du cache"
+            "FAIL: remove() did not purge the file from the cache"
         );
 
         let _ = fs::remove_file(&path);
     }
 
-    /// TEST 4 : Résistance à la concurrence massive (Race Conditions)
-    /// Simule un explorateur de fichiers agressif (ex: macOS Finder) qui lance
-    /// 20 threads simultanés pour lire le même fichier.
+    /// TEST 4: Resistance to massive concurrency (Race Conditions)
+    /// Simulates an aggressive file explorer (e.g., macOS Finder) launching
+    /// 20 simultaneous threads to read the same file.
     #[test]
     fn test_cache_heavy_concurrency() {
         let cache = Arc::new(FileCache::new());
         let path = Arc::new(PathBuf::from("test_cache_concurrent.enc"));
 
-        // Initialisation propre
+        // Clean initialization
         let _ = fs::remove_file(path.as_ref());
         let _ = cache
             .get_or_open(path.as_ref(), dummy_cipher(), true, true)
@@ -204,7 +203,7 @@ mod tests {
 
         let mut handles = vec![];
 
-        // Lancement de 20 threads qui tentent d'accéder au même fichier
+        // Launch 20 threads trying to access the same file
         for _ in 0..20 {
             let cache_clone = cache.clone();
             let path_clone = path.clone();
@@ -216,29 +215,29 @@ mod tests {
             }));
         }
 
-        // Récupération de tous les pointeurs
+        // Retrieve all pointers
         let mut resolved_arcs = vec![];
         for handle in handles {
             resolved_arcs.push(handle.join().unwrap());
         }
 
-        // ASSERTION CRITIQUE : Les 20 threads doivent partager EXACTEMENT le même pointeur Arc.
-        // Si DashMap est mal utilisé, cela créerait des doublons.
+        // CRITICAL ASSERTION: All 20 threads must share EXACTLY the same Arc pointer.
+        // If DashMap is misused, this would create duplicates.
         let reference_arc = &resolved_arcs[0];
         for arc in resolved_arcs.iter().skip(1) {
             assert!(
                 Arc::ptr_eq(reference_arc, arc),
-                "FAIL: Race condition détectée ! Plusieurs instances créées en parallèle."
+                "FAIL: Race condition detected! Multiple instances created in parallel."
             );
         }
 
-        // Le DashMap final ne doit toujours contenir qu'une seule entrée logique.
+        // The final DashMap must still contain only one logical entry.
         assert_eq!(cache.entries.len(), 1);
 
         let _ = fs::remove_file(path.as_ref());
     }
 
-    /// TEST 5 : Sécurité du Flush global à l'extinction du serveur
+    /// TEST 5: Safety of global Flush on server shutdown
     #[test]
     fn test_cache_flush_all() {
         let cache = FileCache::new();
@@ -254,7 +253,7 @@ mod tests {
             .get_or_open(&path2, dummy_cipher(), true, true)
             .unwrap();
 
-        // Ne doit ni paniquer, ni créer de deadlock (verrouillage croisé)
+        // Must not panic, nor create a deadlock (cross-locking)
         cache.flush_all();
 
         let _ = fs::remove_file(&path1);
