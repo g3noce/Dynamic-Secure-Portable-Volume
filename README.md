@@ -12,6 +12,14 @@ DSPV transforms any standard folder into an **encrypted vault**. By placing the 
 
 Access is provided transparently via a local WebDAV server. You interact with your files through your OS's native file explorer, and DSPV handles the encryption and decryption on the fly in memory.
 
+Gate to **encrypted vault** :
+
+<img width="480" height="368" alt="image" src="https://github.com/user-attachments/assets/cc1f72e7-b89c-44fd-afe6-66418e095af8" />
+
+**encrypted vault** :
+
+<img width="392" height="247" alt="image" src="https://github.com/user-attachments/assets/6bc775ae-f614-4f87-b7ab-aac1a37fc039" />
+
 ## 🛡️ Core Features
 
 * **True Portability:** Single standalone executable. No drivers or administrative privileges required on the host machine.
