@@ -9,7 +9,7 @@ use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use clap::Parser; // <-- NOUVEAU
+use clap::Parser;
 use dav_server::DavHandler;
 use dav_server::memls::MemLs;
 use hyper::server::conn::http1;
@@ -18,6 +18,7 @@ use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 use tokio::signal;
 
+use crate::crypto::cipher::AuthenticatedChunkCipher;
 use crate::protocol::webdav::WebDavFS;
 use crate::storage::cache::FileCache;
 
@@ -63,8 +64,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
 
-    let file_cache = Arc::new(FileCache::new());
-    let dav_fs = WebDavFS::new(&physical_root, master_key, file_cache.clone());
+    let file_cache = Arc::new(FileCache::new(200));
+
+    let cipher = crate::crypto::cipher::ChaChaPolyCipher::new(master_key.clone());
+    let index_manager = match crate::storage::index::IndexManager::load_or_create(
+        std::path::Path::new(&physical_root),
+        &cipher,
+    ) {
+        Ok(idx) => Arc::new(std::sync::Mutex::new(idx)),
+        Err(e) => {
+            eprintln!("\n[!] Index ERROR: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    let dav_fs = WebDavFS::new(
+        &physical_root,
+        master_key,
+        file_cache.clone(),
+        index_manager.clone(),
+    );
 
     let dav_server = DavHandler::builder()
         .filesystem(Box::new(dav_fs))
@@ -111,6 +130,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 println!("[*] Finalizing file synchronization...");
                 file_cache.flush_all();
+
+                println!("[*] Saving file index...");
+                if let Ok(guard) = index_manager.lock()
+                    && let Err(e) = guard.save(&cipher)
+                {
+                    eprintln!("[!] Failed to save index: {}", e);
+                }
 
                 break;
             }

@@ -4,22 +4,21 @@ use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::Path;
 
-use crate::crypto::cipher::{Aes256XtsCipher, ChunkCipher};
+use crate::crypto::cipher::{AuthenticatedChunkCipher, ChaChaPolyCipher};
 use crate::crypto::kdf::{Argon2Kdf, KeyDerivation};
 use crate::utils::memory::SecureKey;
 
 const VAULT_MAGIC: &[u8; 4] = b"DSPM";
 const SALT_SIZE: usize = 32;
-const VERIFY_BLOCK_SIZE: usize = 32;
+const ARGON2_PARAMS_SIZE: usize = 12;
+const VERIFY_BLOCK_SIZE: usize = 72;
 
-// --- ADDITION: Structured enum for custom errors ---
 #[derive(Debug)]
 pub enum VaultError {
     KdfFailedCreate,
     EncryptVerifyFailed,
     InvalidMagic,
     KdfFailedUnlock,
-    DecryptVerifyFailed,
     WrongPassword,
 }
 
@@ -32,17 +31,13 @@ impl fmt::Display for VaultError {
             }
             VaultError::InvalidMagic => ("unlock_existing", "corrupt or invalid meta file"),
             VaultError::KdfFailedUnlock => ("unlock_existing", "KDF failed"),
-            VaultError::DecryptVerifyFailed => {
-                ("unlock_existing", "failed to decrypt verification block")
-            }
-            VaultError::WrongPassword => ("unlock_existing", "incorrect password"),
+            VaultError::WrongPassword => ("unlock_existing", "incorrect password or corrupted MAC"),
         };
         write!(f, "mod: vault, function: {}, cause: {}", func, cause)
     }
 }
 
 impl std::error::Error for VaultError {}
-// ----------------------------------------------------------------------
 
 pub struct VaultManager;
 
@@ -64,21 +59,29 @@ impl VaultManager {
         let mut salt = [0u8; SALT_SIZE];
         rand::rng().fill_bytes(&mut salt);
 
-        let master_key = Argon2Kdf::derive_key(password, &salt)
-            .map_err(|_| io::Error::other(VaultError::KdfFailedCreate))?;
+        let iterations: u32 = 3;
+        let memory: u32 = 65536;
+        let parallelism: u32 = 4;
 
-        let mut verify_block = [0u8; VERIFY_BLOCK_SIZE];
+        let master_key =
+            Argon2Kdf::derive_key_with_params(password, &salt, iterations, memory, parallelism)
+                .map_err(|_| io::Error::other(VaultError::KdfFailedCreate))?;
+
+        let verify_clear = [0u8; 32];
         let meta_iv = [0u8; 16];
-        let cipher = Aes256XtsCipher::new(master_key.clone());
+        let cipher = ChaChaPolyCipher::new(master_key.clone());
 
-        cipher
-            .encrypt_chunk(&meta_iv, 0, &mut verify_block)
+        let encrypted_verify = cipher
+            .encrypt_chunk(&meta_iv, 0, &verify_clear)
             .map_err(|_| io::Error::other(VaultError::EncryptVerifyFailed))?;
 
         let mut file = File::create(meta_path)?;
         file.write_all(VAULT_MAGIC)?;
         file.write_all(&salt)?;
-        file.write_all(&verify_block)?;
+        file.write_all(&iterations.to_le_bytes())?;
+        file.write_all(&memory.to_le_bytes())?;
+        file.write_all(&parallelism.to_le_bytes())?;
+        file.write_all(&encrypted_verify)?;
         file.flush()?;
 
         Ok(master_key)
@@ -96,22 +99,26 @@ impl VaultManager {
         let mut salt = [0u8; SALT_SIZE];
         file.read_exact(&mut salt)?;
 
+        let mut params = [0u8; ARGON2_PARAMS_SIZE];
+        file.read_exact(&mut params)?;
+
+        let iterations = u32::from_le_bytes(params[0..4].try_into().unwrap());
+        let memory = u32::from_le_bytes(params[4..8].try_into().unwrap());
+        let parallelism = u32::from_le_bytes(params[8..12].try_into().unwrap());
+
         let mut verify_block = [0u8; VERIFY_BLOCK_SIZE];
         file.read_exact(&mut verify_block)?;
 
-        let master_key = Argon2Kdf::derive_key(password, &salt)
-            .map_err(|_| io::Error::other(VaultError::KdfFailedUnlock))?;
+        let master_key =
+            Argon2Kdf::derive_key_with_params(password, &salt, iterations, memory, parallelism)
+                .map_err(|_| io::Error::other(VaultError::KdfFailedUnlock))?;
 
-        let cipher = Aes256XtsCipher::new(master_key.clone());
+        let cipher = ChaChaPolyCipher::new(master_key.clone());
         let meta_iv = [0u8; 16];
 
         cipher
-            .decrypt_chunk(&meta_iv, 0, &mut verify_block)
-            .map_err(|_| io::Error::other(VaultError::DecryptVerifyFailed))?;
-
-        if verify_block != [0u8; VERIFY_BLOCK_SIZE] {
-            return Err(io::Error::other(VaultError::WrongPassword));
-        }
+            .decrypt_chunk(&meta_iv, 0, &verify_block)
+            .map_err(|_| io::Error::other(VaultError::WrongPassword))?;
 
         Ok(master_key)
     }
@@ -122,157 +129,151 @@ mod tests {
     use super::*;
     use std::fs::{self, OpenOptions};
     use std::io::{Seek, SeekFrom};
+    use std::path::PathBuf;
 
     // --- Helper ---
-    fn setup_test_env(name: &str) -> String {
-        let _ = fs::remove_dir_all(name);
-        fs::create_dir_all(name).unwrap();
-        name.to_string()
+    // Automates isolated environment setup and guarantees cleanup even on test panics.
+    struct TestEnv {
+        root: PathBuf,
     }
 
-    fn teardown_test_env(name: &str) {
-        let _ = fs::remove_dir_all(name);
+    impl TestEnv {
+        fn new(name: &str) -> Self {
+            let root = PathBuf::from(name);
+            let _ = fs::remove_dir_all(&root);
+            fs::create_dir_all(&root).unwrap();
+            Self { root }
+        }
     }
 
-    /// TEST 1: Normal lifecycle (Valid creation and unlock)
+    impl Drop for TestEnv {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    /// TEST 1: Creation and Legitimate Unlocking
+    /// Covers initial creation, subsequent unlocking, and edge cases like empty passwords.
     #[test]
-    fn test_vault_lifecycle_success() {
-        let root = setup_test_env("test_vault_lifecycle");
-        let password = "super_secure_password_123!";
+    fn test_vault_lifecycle() {
+        let env = TestEnv::new("test_vault_lifecycle");
+        let pwd = "secure_password_123!";
 
-        // 1. Creation
-        let key_1 = VaultManager::unlock_or_create(&root, password).expect("Creation failed");
-        assert!(Path::new(&root).join("dspv.meta").exists());
-
-        // 2. Unlock
-        let key_2 = VaultManager::unlock_or_create(&root, password).expect("Unlock failed");
-
-        // The key in RAM must be strictly identical
-        assert_eq!(key_1.0, key_2.0, "Derived keys do not match!");
-
-        teardown_test_env(&root);
-    }
-
-    /// TEST 2: Strict rejection of a wrong password
-    #[test]
-    fn test_vault_wrong_password() {
-        let root = setup_test_env("test_vault_wrong_pwd");
-
-        VaultManager::unlock_or_create(&root, "good_password").unwrap();
-        let result = VaultManager::unlock_or_create(&root, "bad_password");
-
+        // 1. Initial Creation
+        let key_create = VaultManager::unlock_or_create(&env.root, pwd).expect("Creation failed");
         assert!(
-            result.is_err(),
-            "CRITICAL: The system accepted a wrong password!"
-        );
-        // MODIFICATION HERE: Adapted to the new error message convention
-        assert_eq!(
-            result.unwrap_err().to_string(),
-            "mod: vault, function: unlock_existing, cause: incorrect password"
+            env.root.join("dspv.meta").exists(),
+            "Meta file was not created"
         );
 
-        teardown_test_env(&root);
+        // 2. Successful Unlock
+        let key_unlock = VaultManager::unlock_or_create(&env.root, pwd).expect("Unlock failed");
+        assert_eq!(
+            key_create.0, key_unlock.0,
+            "Derived keys must match on successful unlock"
+        );
+
+        // 3. Edge Case: Empty Password
+        let env_empty = TestEnv::new("test_vault_empty_pwd");
+        let key_empty_1 = VaultManager::unlock_or_create(&env_empty.root, "").unwrap();
+        let key_empty_2 = VaultManager::unlock_or_create(&env_empty.root, "").unwrap();
+        assert_eq!(
+            key_empty_1.0, key_empty_2.0,
+            "Empty password handling failed"
+        );
     }
 
-    /// TEST 3: Resilience against a truncated file (Short Read)
-    /// Prevents the program from panicking if the meta file is less than 68 bytes.
+    /// TEST 2: Rejection Mechanisms (Bad Password & Corrupted File)
+    /// Validates the system gracefully denies access without panicking.
     #[test]
-    fn test_vault_truncated_file_no_panic() {
-        let root = setup_test_env("test_vault_truncated");
-        let meta_path = Path::new(&root).join("dspv.meta");
+    fn test_vault_rejections() {
+        let env = TestEnv::new("test_vault_rejections");
+        let pwd = "good_password";
 
-        // Forge a file with only the Magic Number and part of the salt (10 bytes total)
-        let mut file = File::create(&meta_path).unwrap();
-        file.write_all(b"DSPM").unwrap();
-        file.write_all(&[0x42; 6]).unwrap();
+        VaultManager::unlock_or_create(&env.root, pwd).unwrap();
+
+        // 1. Wrong Password
+        let result_bad_pwd = VaultManager::unlock_or_create(&env.root, "bad_password");
+        assert!(
+            matches!(
+                result_bad_pwd
+                    .unwrap_err()
+                    .into_inner()
+                    .unwrap()
+                    .downcast_ref::<VaultError>(),
+                Some(VaultError::WrongPassword)
+            ),
+            "System must specifically reject invalid passwords with WrongPassword error"
+        );
+
+        // 2. Truncated File (Simulating OS interruption or physical corruption)
+        let meta_path = env.root.join("dspv.meta");
+        let mut file = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&meta_path)
+            .unwrap();
+        file.write_all(b"DSP").unwrap(); // Missing 1 byte of magic + everything else
         drop(file);
 
-        let result = VaultManager::unlock_or_create(&root, "password");
-
-        assert!(result.is_err(), "The system must reject a truncated file");
+        let result_trunc = VaultManager::unlock_or_create(&env.root, pwd);
         assert_eq!(
-            result.unwrap_err().kind(),
+            result_trunc.unwrap_err().kind(),
             io::ErrorKind::UnexpectedEof,
-            "The error must be UnexpectedEof (premature end of file), not a system crash"
+            "Truncated files must yield an UnexpectedEof error, not a crash"
         );
-
-        teardown_test_env(&root);
     }
 
-    /// TEST 4: Attempted Salt Tampering
-    /// Modifying even 1 byte of the salt should alter the KDF result and reject access.
+    /// TEST 3: Cryptographic Anti-Tampering Validation
+    /// Ensures modifications to the salt, KDF parameters, or ciphertext block reject the unlock.
     #[test]
-    fn test_vault_salt_tampering() {
-        let root = setup_test_env("test_vault_salt_tamper");
-        let meta_path = Path::new(&root).join("dspv.meta");
-        let password = "password";
+    fn test_vault_tamper_resistance() {
+        let env = TestEnv::new("test_vault_tamper");
+        let pwd = "tamper_test_pwd";
+        let meta_path = env.root.join("dspv.meta");
 
-        VaultManager::unlock_or_create(&root, password).unwrap();
+        // Base implementation to be tampered with
+        VaultManager::unlock_or_create(&env.root, pwd).unwrap();
 
-        // Open in binary write mode
+        // 1. Tamper with the Verify Block (Starts at offset: 4 Magic + 32 Salt + 12 Params = 48)
         let mut file = OpenOptions::new().write(true).open(&meta_path).unwrap();
+        file.seek(SeekFrom::Start(50)).unwrap();
+        file.write_all(&[0xFF]).unwrap();
+        drop(file);
 
-        // The salt starts at offset 4 (after "DSPM"). We modify the byte at offset 10.
+        assert!(
+            VaultManager::unlock_or_create(&env.root, pwd).is_err(),
+            "CRITICAL: Vault opened despite a corrupted MAC in the verification block!"
+        );
+
+        // Reset for next check
+        let _ = fs::remove_file(&meta_path);
+        VaultManager::unlock_or_create(&env.root, pwd).unwrap();
+
+        // 2. Tamper with the Salt (Starts at offset: 4)
+        let mut file = OpenOptions::new().write(true).open(&meta_path).unwrap();
         file.seek(SeekFrom::Start(10)).unwrap();
-        file.write_all(&[0xFF]).unwrap();
+        file.write_all(&[0x00]).unwrap();
         drop(file);
 
-        let result = VaultManager::unlock_or_create(&root, password);
-
         assert!(
-            result.is_err(),
-            "CRITICAL: Tampering with the salt did not invalidate the vault!"
+            VaultManager::unlock_or_create(&env.root, pwd).is_err(),
+            "CRITICAL: Salt modification must invalidate the derived key!"
         );
 
-        teardown_test_env(&root);
-    }
+        // Reset for next check
+        let _ = fs::remove_file(&meta_path);
+        VaultManager::unlock_or_create(&env.root, pwd).unwrap();
 
-    /// TEST 5: Attempted verification block tampering
-    /// If an attacker modifies the encrypted signature, decryption will yield
-    /// a result different from [0; 32] and access must be blocked.
-    #[test]
-    fn test_vault_verify_block_tampering() {
-        let root = setup_test_env("test_vault_block_tamper");
-        let meta_path = Path::new(&root).join("dspv.meta");
-        let password = "password";
-
-        VaultManager::unlock_or_create(&root, password).unwrap();
-
+        // 3. Tamper with Argon2 Parameters (Starts at offset: 36)
         let mut file = OpenOptions::new().write(true).open(&meta_path).unwrap();
-
-        // The verification block starts at offset 36 (4 Magic + 32 Salt).
-        file.seek(SeekFrom::Start(40)).unwrap();
-        file.write_all(&[0xFF]).unwrap();
+        file.seek(SeekFrom::Start(36)).unwrap(); // Altering the iteration count
+        file.write_all(&[0x01]).unwrap();
         drop(file);
 
-        let result = VaultManager::unlock_or_create(&root, password);
-
         assert!(
-            result.is_err(),
-            "CRITICAL: The vault opened despite a corrupted verification block!"
+            VaultManager::unlock_or_create(&env.root, pwd).is_err(),
+            "CRITICAL: Modifying KDF parameters must fail the unlock process!"
         );
-
-        teardown_test_env(&root);
-    }
-
-    /// TEST 6: Handling an empty password
-    /// Verifies that the KDF algorithm (Argon2) can cleanly ingest an empty string.
-    #[test]
-    fn test_vault_empty_password_handling() {
-        let root = setup_test_env("test_vault_empty_pwd");
-
-        let result_create = VaultManager::unlock_or_create(&root, "");
-        assert!(
-            result_create.is_ok(),
-            "The system must handle an empty password without crashing"
-        );
-
-        let result_unlock = VaultManager::unlock_or_create(&root, "");
-        assert!(
-            result_unlock.is_ok(),
-            "The system must unlock with an empty password"
-        );
-
-        teardown_test_env(&root);
     }
 }

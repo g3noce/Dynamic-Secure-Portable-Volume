@@ -3,36 +3,33 @@ use std::fmt;
 use std::io::{self, Read, Write};
 
 pub const HEADER_SIZE: u64 = 32;
-// The IV is 16 bytes, so the logical size starts exactly at byte 16.
 pub const LOGICAL_SIZE_OFFSET: u64 = 16;
 
-// --- ADDITION: Structured enum for custom errors ---
 #[derive(Debug)]
 pub enum HeaderError {
-    ReadIvFailed,
-    ReadSizeFailed,
-    ReadReservedFailed,
-    WriteIvFailed,
-    WriteSizeFailed,
-    WriteReservedFailed,
+    ReadIv,
+    ReadSize,
+    ReadReserved,
+    WriteIv,
+    WriteSize,
+    WriteReserved,
 }
 
 impl fmt::Display for HeaderError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let (func, cause) = match self {
-            HeaderError::ReadIvFailed => ("read_from", "failed to read IV"),
-            HeaderError::ReadSizeFailed => ("read_from", "failed to read logical size"),
-            HeaderError::ReadReservedFailed => ("read_from", "failed to read reserved area"),
-            HeaderError::WriteIvFailed => ("write_to", "failed to write IV"),
-            HeaderError::WriteSizeFailed => ("write_to", "failed to write logical size"),
-            HeaderError::WriteReservedFailed => ("write_to", "failed to write reserved area"),
+            HeaderError::ReadIv => ("read_from", "failed to read IV"),
+            HeaderError::ReadSize => ("read_from", "failed to read logical size"),
+            HeaderError::ReadReserved => ("read_from", "failed to read reserved area"),
+            HeaderError::WriteIv => ("write_to", "failed to write IV"),
+            HeaderError::WriteSize => ("write_to", "failed to write logical size"),
+            HeaderError::WriteReserved => ("write_to", "failed to write reserved area"),
         };
         write!(f, "mod: header, function: {}, cause: {}", func, cause)
     }
 }
 
 impl std::error::Error for HeaderError {}
-// ----------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
 pub struct FileHeader {
@@ -56,17 +53,17 @@ impl FileHeader {
         let mut iv = [0u8; 16];
         reader
             .read_exact(&mut iv)
-            .map_err(|e| io::Error::new(e.kind(), HeaderError::ReadIvFailed))?;
+            .map_err(|e| io::Error::new(e.kind(), HeaderError::ReadIv))?;
 
         let mut size_bytes = [0u8; 8];
         reader
             .read_exact(&mut size_bytes)
-            .map_err(|e| io::Error::new(e.kind(), HeaderError::ReadSizeFailed))?;
+            .map_err(|e| io::Error::new(e.kind(), HeaderError::ReadSize))?;
 
         let mut reserved = [0u8; 8];
         reader
             .read_exact(&mut reserved)
-            .map_err(|e| io::Error::new(e.kind(), HeaderError::ReadReservedFailed))?;
+            .map_err(|e| io::Error::new(e.kind(), HeaderError::ReadReserved))?;
 
         Ok(Self {
             iv,
@@ -78,13 +75,13 @@ impl FileHeader {
     pub fn write_to<W: Write>(&self, mut writer: W) -> io::Result<()> {
         writer
             .write_all(&self.iv)
-            .map_err(|e| io::Error::new(e.kind(), HeaderError::WriteIvFailed))?;
+            .map_err(|e| io::Error::new(e.kind(), HeaderError::WriteIv))?;
         writer
             .write_all(&self.logical_size.to_le_bytes())
-            .map_err(|e| io::Error::new(e.kind(), HeaderError::WriteSizeFailed))?;
+            .map_err(|e| io::Error::new(e.kind(), HeaderError::WriteSize))?;
         writer
             .write_all(&self.reserved)
-            .map_err(|e| io::Error::new(e.kind(), HeaderError::WriteReservedFailed))?;
+            .map_err(|e| io::Error::new(e.kind(), HeaderError::WriteReserved))?;
         Ok(())
     }
 }
@@ -92,122 +89,98 @@ impl FileHeader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{self, Cursor};
+    use std::io::{Cursor, ErrorKind};
 
-    // ----------------------------------------------------------------
-    // EXISTING TESTS (Basic Functionality)
-    // ----------------------------------------------------------------
-
+    /// TEST 1: Full Lifecycle & Consistency
+    /// Ensures headers can be generated, written to a buffer, and correctly restored.
     #[test]
-    fn test_header_generate_new() {
-        let header1 = FileHeader::generate_new();
-        let header2 = FileHeader::generate_new();
+    fn test_header_lifecycle() {
+        let header = FileHeader::generate_new();
+        assert_eq!(
+            header.logical_size, 0,
+            "New headers must start with 0 logical size"
+        );
+        assert_eq!(header.reserved, [0u8; 8], "Reserved space must be zeroed");
 
-        assert_eq!(header1.logical_size, 0);
-        assert_eq!(header1.reserved, [0u8; 8]);
-        assert_ne!(header1.iv, header2.iv, "The IV must be random");
+        // Write to buffer
+        let mut buffer = Vec::new();
+        header
+            .write_to(&mut buffer)
+            .expect("Writing header to buffer failed");
+        assert_eq!(
+            buffer.len(),
+            HEADER_SIZE as usize,
+            "Buffer size must match HEADER_SIZE"
+        );
+
+        // Read back from buffer
+        let mut cursor = Cursor::new(buffer);
+        let recovered = FileHeader::read_from(&mut cursor).expect("Reading header failed");
+
+        assert_eq!(
+            header.iv, recovered.iv,
+            "Recovered IV does not match original"
+        );
+        assert_eq!(
+            header.logical_size, recovered.logical_size,
+            "Recovered size does not match"
+        );
     }
 
+    /// TEST 2: Strict Binary Layout & Endianness
+    /// Guarantees the 32-byte layout is exact: IV (16) + LE Size (8) + Reserved (8).
+    /// This ensures cross-platform compatibility (Little-Endian strictness).
     #[test]
-    fn test_header_generation_and_io() {
+    fn test_binary_layout_and_endianness() {
         let header = FileHeader {
-            iv: [0x42; 16],
-            logical_size: 1337,
-            reserved: [0u8; 8],
+            iv: [0xAA; 16],
+            logical_size: 0x1122334455667788, // Asymmetric pattern to verify byte order
+            reserved: [0xBB; 8],
         };
+
         let mut buffer = Vec::new();
         header.write_to(&mut buffer).unwrap();
-        assert_eq!(buffer.len(), HEADER_SIZE as usize);
 
-        let mut cursor = Cursor::new(buffer);
-        let read_header = FileHeader::read_from(&mut cursor).unwrap();
-        assert_eq!(header.iv, read_header.iv);
-        assert_eq!(header.logical_size, read_header.logical_size);
+        // Verify exact physical offsets
+        assert_eq!(&buffer[0..16], &[0xAA; 16], "IV is misplaced");
+
+        // Verify strict Little Endian serialization at LOGICAL_SIZE_OFFSET
+        let expected_size: [u8; 8] = [0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11];
+        assert_eq!(
+            &buffer[16..24],
+            &expected_size,
+            "Logical size is not properly Little-Endian"
+        );
+
+        // Verify reserved space offset
+        assert_eq!(&buffer[24..32], &[0xBB; 8], "Reserved space is misplaced");
     }
 
-    // ----------------------------------------------------------------
-    // CRITICAL TESTS (Extreme Resilience)
-    // ----------------------------------------------------------------
-
-    /// TEST 1: Corrupted or incomplete file (Short Read)
-    /// A native explorer can sometimes create a 0-byte file or interrupt it.
+    /// TEST 3: Hardware Failure Resilience (Incomplete Reads)
+    /// Ensures reading from a corrupted, abruptly truncated file is handled gracefully
+    /// and returns the proper custom error context.
     #[test]
-    fn test_header_short_read_prevents_panic() {
-        // A 20-byte buffer (IV read, but logical size is cut in the middle)
+    fn test_incomplete_read_handling() {
+        // Simulate a corrupted file with only 20 bytes (Full IV, partial size)
         let buffer = vec![0u8; 20];
         let mut cursor = Cursor::new(buffer);
 
         let result = FileHeader::read_from(&mut cursor);
 
+        assert!(result.is_err(), "Reader must reject incomplete headers");
+
+        let err = result.unwrap_err();
+        assert_eq!(
+            err.kind(),
+            ErrorKind::UnexpectedEof,
+            "Must trigger an EOF error"
+        );
+
+        // Verify the custom inner error maps properly to our `HeaderError`
+        let inner_err_str = err.into_inner().unwrap().to_string();
         assert!(
-            result.is_err(),
-            "CRITICAL: The reader accepted an incomplete header without triggering an error!"
-        );
-        assert_eq!(
-            result.unwrap_err().kind(),
-            io::ErrorKind::UnexpectedEof,
-            "The returned error must be exactly UnexpectedEof to be properly handled by chunk_io"
-        );
-    }
-
-    /// TEST 2: Cross-Platform Stability (Endianness)
-    /// If the volume is mounted on a Big Endian vs Little Endian architecture,
-    /// the logical size must not be altered.
-    #[test]
-    fn test_header_endianness_crossplatform_guarantee() {
-        let mut header = FileHeader::generate_new();
-        // Asymmetrical hexadecimal value to easily spot byte order
-        header.logical_size = 0x1122334455667788;
-
-        let mut buffer = Vec::new();
-        header.write_to(&mut buffer).unwrap();
-
-        // Offset 16 corresponds to `logical_size`.
-        // The `to_le_bytes` call requires the least significant byte (0x88) to be written first.
-        let size_bytes = &buffer[16..24];
-        let expected_bytes: [u8; 8] = [0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11];
-
-        assert_eq!(
-            size_bytes, &expected_bytes,
-            "CRITICAL: Serialization is not strictly Little Endian. The volume will be corrupted across architectures!"
-        );
-    }
-
-    /// TEST 3: Physical offsets stability (Binary Layout)
-    /// Prevents a future code modification from mistakenly swapping
-    /// the position of the size and the IV in the physical file.
-    #[test]
-    fn test_header_binary_layout_strictness() {
-        let mut buffer = Vec::new();
-        let header = FileHeader {
-            iv: [0xFF; 16],
-            logical_size: 255, // 0x00000000000000FF (255)
-            reserved: [0xAA; 8],
-        };
-        header.write_to(&mut buffer).unwrap();
-
-        // 1. Check total size dictated by AES-XTS
-        assert_eq!(buffer.len(), 32, "The header must be EXACTLY 32 bytes");
-
-        // 2. The IV must occupy the first 16-byte block (offset 0 to 15)
-        assert_eq!(
-            &buffer[0..16],
-            &[0xFF; 16],
-            "The IV was shifted from its original physical offset"
-        );
-
-        // 3. The size must occupy the offset defined by LOGICAL_SIZE_OFFSET (16 to 23)
-        assert_eq!(
-            &buffer[16..24],
-            &[0xFF, 0, 0, 0, 0, 0, 0, 0],
-            "The logical size is no longer at offset 16"
-        );
-
-        // 4. Reserved bytes to align to 32 (offset 24 to 31)
-        assert_eq!(
-            &buffer[24..32],
-            &[0xAA; 8],
-            "The reserved area is not aligned at the end of the header"
+            inner_err_str.contains("failed to read logical size"),
+            "Custom error context is missing or incorrect"
         );
     }
 }

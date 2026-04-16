@@ -1,20 +1,22 @@
-use crate::utils::memory::SecureKey;
-use aes::cipher::KeyInit;
-use aes::Aes256;
+use chacha20poly1305::aead::{Aead, KeyInit};
+use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
 use std::fmt;
-use xts_mode::{get_tweak_default, Xts128};
+
+use crate::utils::memory::SecureKey;
 
 #[derive(Debug)]
 pub enum CipherError {
-    InitializationFailed,
-    AlignmentError,
+    AuthenticationFailed,
+    EncryptionFailed,
 }
 
 impl fmt::Display for CipherError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let cause = match self {
-            CipherError::InitializationFailed => "invalid key size (must be 64) or IV (must be 16)",
-            CipherError::AlignmentError => "data is not a multiple of 16 bytes",
+            CipherError::AuthenticationFailed => {
+                "MAC verification failed (data corrupted or tampered)"
+            }
+            CipherError::EncryptionFailed => "encryption process failed",
         };
         write!(
             f,
@@ -26,85 +28,97 @@ impl fmt::Display for CipherError {
 
 impl std::error::Error for CipherError {}
 
-pub trait ChunkCipher {
+pub trait AuthenticatedChunkCipher {
     fn new(key: SecureKey) -> Self;
 
     fn encrypt_chunk(
         &self,
-        file_iv: &[u8],
-        offset: u64,
-        data: &mut [u8],
-    ) -> Result<(), CipherError>;
+        file_iv: &[u8; 16],
+        chunk_index: u64,
+        clear_data: &[u8],
+    ) -> Result<Vec<u8>, CipherError>;
 
     fn decrypt_chunk(
         &self,
-        file_iv: &[u8],
-        offset: u64,
-        data: &mut [u8],
-    ) -> Result<(), CipherError>;
+        file_iv: &[u8; 16],
+        chunk_index: u64,
+        encrypted_data: &[u8],
+    ) -> Result<Vec<u8>, CipherError>;
 }
 
-pub struct Aes256XtsCipher {
-    key: SecureKey,
+pub struct ChaChaPolyCipher {
+    cipher: XChaCha20Poly1305,
 }
 
-impl ChunkCipher for Aes256XtsCipher {
+impl AuthenticatedChunkCipher for ChaChaPolyCipher {
     fn new(key: SecureKey) -> Self {
-        Self { key }
+        let mut k = [0u8; 32];
+        let copy_len = std::cmp::min(key.0.len(), 32);
+        k[..copy_len].copy_from_slice(&key.0[..copy_len]);
+
+        let cipher = XChaCha20Poly1305::new(Key::from_slice(&k));
+        Self { cipher }
     }
 
     fn encrypt_chunk(
         &self,
-        file_iv: &[u8],
-        offset: u64,
-        data: &mut [u8],
-    ) -> Result<(), CipherError> {
-        if self.key.0.len() != 64 || file_iv.len() != 16 {
-            return Err(CipherError::InitializationFailed);
-        }
-        if !data.len().is_multiple_of(16) {
-            return Err(CipherError::AlignmentError);
-        }
+        file_iv: &[u8; 16],
+        chunk_index: u64,
+        clear_data: &[u8],
+    ) -> Result<Vec<u8>, CipherError> {
+        use chacha20poly1305::aead::Payload;
+        use rand::Rng;
 
-        let key1: [u8; 32] = self.key.0[0..32].try_into().unwrap();
-        let key2: [u8; 32] = self.key.0[32..64].try_into().unwrap();
+        let mut nonce_bytes = [0u8; 24];
+        rand::rng().fill_bytes(&mut nonce_bytes);
+        let nonce = XNonce::from_slice(&nonce_bytes);
 
-        let cipher_1 = Aes256::new(&key1.into());
-        let cipher_2 = Aes256::new(&key2.into());
-        let xts = Xts128::<Aes256>::new(cipher_1, cipher_2);
+        let mut aad = Vec::with_capacity(24);
+        aad.extend_from_slice(file_iv);
+        aad.extend_from_slice(&chunk_index.to_le_bytes());
 
-        let sector_index =
-            ((offset / 16) as u128).wrapping_add(u128::from_le_bytes(file_iv.try_into().unwrap()));
+        let payload = Payload {
+            msg: clear_data,
+            aad: &aad,
+        };
 
-        xts.encrypt_area(data, 16, sector_index, get_tweak_default);
-        Ok(())
+        let mut encrypted = self
+            .cipher
+            .encrypt(nonce, payload)
+            .map_err(|_| CipherError::EncryptionFailed)?;
+
+        let mut result = nonce_bytes.to_vec();
+        result.append(&mut encrypted);
+        Ok(result)
     }
 
     fn decrypt_chunk(
         &self,
-        file_iv: &[u8],
-        offset: u64,
-        data: &mut [u8],
-    ) -> Result<(), CipherError> {
-        if self.key.0.len() != 64 || file_iv.len() != 16 {
-            return Err(CipherError::InitializationFailed);
+        file_iv: &[u8; 16],
+        chunk_index: u64,
+        encrypted_data: &[u8],
+    ) -> Result<Vec<u8>, CipherError> {
+        use chacha20poly1305::aead::Payload;
+
+        if encrypted_data.len() < 40 {
+            return Err(CipherError::AuthenticationFailed);
         }
-        if !data.len().is_multiple_of(16) {
-            return Err(CipherError::AlignmentError);
-        }
 
-        let key1: [u8; 32] = self.key.0[0..32].try_into().unwrap();
-        let key2: [u8; 32] = self.key.0[32..64].try_into().unwrap();
+        let nonce = XNonce::from_slice(&encrypted_data[0..24]);
+        let actual_ciphertext = &encrypted_data[24..];
 
-        let cipher_1 = Aes256::new(&key1.into());
-        let cipher_2 = Aes256::new(&key2.into());
-        let xts = Xts128::<Aes256>::new(cipher_1, cipher_2);
+        let mut aad = Vec::with_capacity(24);
+        aad.extend_from_slice(file_iv);
+        aad.extend_from_slice(&chunk_index.to_le_bytes());
 
-        let sector_index =
-            ((offset / 16) as u128).wrapping_add(u128::from_le_bytes(file_iv.try_into().unwrap()));
+        let payload = Payload {
+            msg: actual_ciphertext,
+            aad: &aad,
+        };
 
-        xts.decrypt_area(data, 16, sector_index, get_tweak_default);
-        Ok(())
+        self.cipher
+            .decrypt(nonce, payload)
+            .map_err(|_| CipherError::AuthenticationFailed)
     }
 }
 
@@ -113,169 +127,58 @@ mod tests {
     use super::*;
     use crate::utils::memory::SecureKey;
 
-    // --- Helper ---
-    fn dummy_cipher() -> Aes256XtsCipher {
-        Aes256XtsCipher::new(SecureKey(vec![0x42; 64]))
-    }
-
-    fn dummy_iv() -> [u8; 16] {
-        [0xAA; 16]
-    }
-
-    // ----------------------------------------------------------------
-    // EXISTING TESTS (Basic Mechanics)
-    // ----------------------------------------------------------------
-
-    #[test]
-    fn test_aes256_xts_chunk_basic() {
-        let cipher = dummy_cipher();
-        let iv = dummy_iv();
-
-        let original_data = b"Hello world!1234This is 32 bytes";
-        let mut data = original_data.to_vec();
-
-        cipher.encrypt_chunk(&iv, 0, &mut data).unwrap();
-        assert_ne!(original_data.as_slice(), data.as_slice());
-
-        cipher.decrypt_chunk(&iv, 0, &mut data).unwrap();
-        assert_eq!(original_data.as_slice(), data.as_slice());
+    fn setup_cipher() -> ChaChaPolyCipher {
+        ChaChaPolyCipher::new(SecureKey(vec![0u8; 32]))
     }
 
     #[test]
-    fn test_cipher_initialization_error() {
-        let cipher = Aes256XtsCipher::new(SecureKey(vec![0x42; 32])); // Key too short
-        let mut data = vec![0u8; 16];
+    fn test_encrypt_decrypt_cycle() {
+        let cipher = setup_cipher();
+        let file_iv = [0u8; 16];
+        let chunk_index = 42u64;
+        let data = b"Sensitive data to encrypt";
 
-        let result = cipher.encrypt_chunk(&dummy_iv(), 0, &mut data);
-        assert!(matches!(result, Err(CipherError::InitializationFailed)));
+        // Success cycle
+        let encrypted = cipher
+            .encrypt_chunk(&file_iv, chunk_index, data)
+            .expect("Encryption failed");
+        let decrypted = cipher
+            .decrypt_chunk(&file_iv, chunk_index, &encrypted)
+            .expect("Decryption failed");
+
+        assert_eq!(data.to_vec(), decrypted);
     }
 
     #[test]
-    fn test_cipher_alignment_error() {
-        let cipher = dummy_cipher();
-        let mut unaligned_data = vec![0u8; 15]; // Not a multiple of 16
+    fn test_integrity_failure_on_tamper() {
+        let cipher = setup_cipher();
+        let file_iv = [0u8; 16];
+        let mut encrypted = cipher.encrypt_chunk(&file_iv, 0, b"data").unwrap();
 
-        let result = cipher.encrypt_chunk(&dummy_iv(), 0, &mut unaligned_data);
-        assert!(matches!(result, Err(CipherError::AlignmentError)));
+        // Tamper with the ciphertext part (after 24 bytes of nonce)
+        let last_idx = encrypted.len() - 1;
+        encrypted[last_idx] ^= 0xFF;
+
+        let result = cipher.decrypt_chunk(&file_iv, 0, &encrypted);
+        assert!(matches!(result, Err(CipherError::AuthenticationFailed)));
     }
 
-    // ----------------------------------------------------------------
-    // CRITICAL TESTS (Cryptographic Properties)
-    // ----------------------------------------------------------------
-
-    /// TEST 1: The fingerprint must change depending on the position (Offset/Tweak)
     #[test]
-    fn test_cipher_offset_dependence() {
-        let cipher = dummy_cipher();
-        let iv = dummy_iv();
-        let payload = [b'A'; 16];
+    fn test_wrong_context_failure() {
+        let cipher = setup_cipher();
+        let file_iv = [0u8; 16];
+        let encrypted = cipher.encrypt_chunk(&file_iv, 1, b"data").unwrap();
 
-        let mut data_at_offset_0 = payload;
-        cipher.encrypt_chunk(&iv, 0, &mut data_at_offset_0).unwrap();
-
-        let mut data_at_offset_16 = payload;
-        cipher
-            .encrypt_chunk(&iv, 16, &mut data_at_offset_16)
-            .unwrap();
-
-        assert_ne!(
-            data_at_offset_0, data_at_offset_16,
-            "CRITICAL: AES-XTS produced the same ciphertext for two different offsets. The sector_index calculation is faulty."
-        );
+        // Decrypting with wrong chunk_index must fail (AAD mismatch)
+        let result = cipher.decrypt_chunk(&file_iv, 2, &encrypted);
+        assert!(matches!(result, Err(CipherError::AuthenticationFailed)));
     }
 
-    /// TEST 2: The fingerprint must change depending on the IV (Renewal)
     #[test]
-    fn test_cipher_iv_dependence() {
-        let cipher = dummy_cipher();
-        let payload = [b'B'; 16];
-
-        let iv1 = [0x11; 16];
-        let mut data_iv1 = payload;
-        cipher.encrypt_chunk(&iv1, 0, &mut data_iv1).unwrap();
-
-        let iv2 = [0x22; 16];
-        let mut data_iv2 = payload;
-        cipher.encrypt_chunk(&iv2, 0, &mut data_iv2).unwrap();
-
-        assert_ne!(
-            data_iv1, data_iv2,
-            "CRITICAL: Changing the IV did not alter the cryptographic signature."
-        );
-    }
-
-    /// TEST 3: Consistency between global and fragmented encryption (Streaming)
-    #[test]
-    fn test_cipher_cross_chunk_equivalence() {
-        let cipher = dummy_cipher();
-        let iv = dummy_iv();
-        let payload = [b'C'; 32]; // 2 strict blocks
-
-        // Encrypting a single 32-byte block
-        let mut monolithic_data = payload;
-        cipher.encrypt_chunk(&iv, 0, &mut monolithic_data).unwrap();
-
-        // Fragmented encryption: two 16-byte calls
-        let mut fragmented_data = payload;
-        let (part1, part2) = fragmented_data.split_at_mut(16);
-
-        cipher.encrypt_chunk(&iv, 0, part1).unwrap();
-        cipher.encrypt_chunk(&iv, 16, part2).unwrap();
-
-        assert_eq!(
-            monolithic_data, fragmented_data,
-            "CRITICAL: Stream encryption (chunking) breaks the XTS structure. Blocks do not align correctly."
-        );
-    }
-
-    /// TEST 4: Sector isolation and Avalanche Effect (Bit-flipping attack)
-    #[test]
-    fn test_cipher_sector_isolation_and_avalanche() {
-        let cipher = dummy_cipher();
-        let iv = dummy_iv();
-
-        let original_data = [b'D'; 32];
-        let mut data = original_data;
-
-        // 1. Encrypt all 32 bytes
-        cipher.encrypt_chunk(&iv, 0, &mut data).unwrap();
-
-        // 2. Attacker corrupts a single bit in the first sector (offset 5)
-        data[5] ^= 0b0000_0001;
-
-        // 3. Decrypt everything
-        cipher.decrypt_chunk(&iv, 0, &mut data).unwrap();
-
-        // 4. Verification of the Avalanche effect: The first sector (0-15) must be completely destroyed
-        assert_ne!(
-            &data[0..16],
-            &original_data[0..16],
-            "CRITICAL: The avalanche effect did not occur on the corrupted sector."
-        );
-
-        // 5. Verification of isolation: The second sector (16-31) must remain intact
-        assert_eq!(
-            &data[16..32],
-            &original_data[16..32],
-            "CRITICAL: Corruption of one sector spilled over to the adjacent sector. XTS isolation is broken."
-        );
-    }
-
-    /// TEST 5: Resistance to extreme limits (Integer Overflow)
-    #[test]
-    fn test_cipher_extreme_offset_wrapping() {
-        let cipher = dummy_cipher();
-        let iv = [0xFF; 16]; // Pushes the internal addition of `sector_index` to its limits
-        let mut data = [b'E'; 16];
-
-        // A massive offset near the type's limit
-        let extreme_offset = u64::MAX - 15;
-
-        // The wrapping_add must not cause the thread to panic
-        let result = cipher.encrypt_chunk(&iv, extreme_offset, &mut data);
-        assert!(
-            result.is_ok(),
-            "The sector_index calculation panicked when facing an extreme offset."
-        );
+    fn test_invalid_input_length() {
+        let cipher = setup_cipher();
+        let tiny_data = vec![0u8; 39]; // Minimum is 40 (24 nonce + 16 tag)
+        let result = cipher.decrypt_chunk(&[0u8; 16], 0, &tiny_data);
+        assert!(matches!(result, Err(CipherError::AuthenticationFailed)));
     }
 }

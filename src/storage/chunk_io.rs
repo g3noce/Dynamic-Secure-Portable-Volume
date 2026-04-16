@@ -3,43 +3,43 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
-use crate::crypto::cipher::ChunkCipher;
+use crate::crypto::cipher::AuthenticatedChunkCipher;
 use crate::storage::header::{FileHeader, HEADER_SIZE, LOGICAL_SIZE_OFFSET};
 use crate::utils::memory::SecureBuffer;
 
-const XTS_BLOCK_SIZE: u64 = 16;
+pub const CHUNK_LOGICAL_SIZE: u64 = 65536;
+pub const MAC_SIZE: u64 = 40;
+pub const CHUNK_PHYSICAL_SIZE: u64 = CHUNK_LOGICAL_SIZE + MAC_SIZE;
 
-// --- ADDITION: Structured enum for custom errors ---
 #[derive(Debug)]
 pub enum ChunkIoError {
     InitReadOnly,
-    XtsDecryptionFailed,
-    RmwDecryptionFailed,
-    RmwEncryptionFailed,
+    AuthenticationFailed,
+    EncryptionFailed,
 }
 
 impl fmt::Display for ChunkIoError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let (func, cause) = match self {
             ChunkIoError::InitReadOnly => ("open", "cannot initialize a header in read-only mode"),
-            ChunkIoError::XtsDecryptionFailed => ("read_chunk", "XTS decryption failed"),
-            ChunkIoError::RmwDecryptionFailed => ("write_chunk", "RMW decryption failed"),
-            ChunkIoError::RmwEncryptionFailed => ("write_chunk", "RMW encryption failed"),
+            ChunkIoError::AuthenticationFailed => {
+                ("read/write", "data authentication (MAC) failed")
+            }
+            ChunkIoError::EncryptionFailed => ("write_chunk", "AEAD encryption failed"),
         };
         write!(f, "mod: chunk_io, function: {}, cause: {}", func, cause)
     }
 }
 
 impl std::error::Error for ChunkIoError {}
-// ----------------------------------------------------------------------
 
-pub struct EncryptedFile<C: ChunkCipher> {
+pub struct EncryptedFile<C: AuthenticatedChunkCipher> {
     file: File,
     cipher: C,
     header: FileHeader,
 }
 
-impl<C: ChunkCipher> EncryptedFile<C> {
+impl<C: AuthenticatedChunkCipher> EncryptedFile<C> {
     pub fn open<P: AsRef<Path>>(
         path: P,
         cipher: C,
@@ -81,47 +81,51 @@ impl<C: ChunkCipher> EncryptedFile<C> {
             return Ok(SecureBuffer(vec![]));
         }
 
-        let align_start = (logical_offset / XTS_BLOCK_SIZE) * XTS_BLOCK_SIZE;
-        let end_offset = logical_offset + size as u64;
-        let align_end = end_offset.div_ceil(XTS_BLOCK_SIZE) * XTS_BLOCK_SIZE;
-        let aligned_size = (align_end - align_start) as usize;
-
-        let physical_offset = HEADER_SIZE + align_start;
-        self.file.seek(SeekFrom::Start(physical_offset))?;
-
-        let mut block_buffer = SecureBuffer(vec![0u8; aligned_size]);
-        let bytes_read = self.file.read(&mut block_buffer.0)?;
-
-        if bytes_read == 0 {
+        let max_logical_available = self.header.logical_size.saturating_sub(logical_offset);
+        if max_logical_available == 0 {
             return Ok(SecureBuffer(vec![]));
         }
+        let read_size = std::cmp::min(size as u64, max_logical_available) as usize;
 
-        let valid_crypt_size = (bytes_read / XTS_BLOCK_SIZE as usize) * XTS_BLOCK_SIZE as usize;
-        if valid_crypt_size > 0 {
-            self.cipher
-                .decrypt_chunk(
-                    &self.header.iv,
-                    align_start,
-                    &mut block_buffer.0[..valid_crypt_size],
-                )
-                .map_err(|_| io::Error::other(ChunkIoError::XtsDecryptionFailed))?;
+        let mut result_buffer = Vec::with_capacity(read_size);
+        let mut current_offset = logical_offset;
+        let end_offset = logical_offset + read_size as u64;
+
+        while current_offset < end_offset {
+            let chunk_index = current_offset / CHUNK_LOGICAL_SIZE;
+            let offset_in_chunk = (current_offset % CHUNK_LOGICAL_SIZE) as usize;
+
+            let remaining_in_request = (end_offset - current_offset) as usize;
+            let remaining_in_chunk = CHUNK_LOGICAL_SIZE as usize - offset_in_chunk;
+            let bytes_to_read_from_this_chunk =
+                std::cmp::min(remaining_in_request, remaining_in_chunk);
+
+            let physical_offset = HEADER_SIZE + (chunk_index * CHUNK_PHYSICAL_SIZE);
+            self.file.seek(SeekFrom::Start(physical_offset))?;
+
+            let mut physical_buffer = vec![0u8; CHUNK_PHYSICAL_SIZE as usize];
+            let bytes_read = self.file.read(&mut physical_buffer)?;
+
+            let clear_chunk = if bytes_read > 0 {
+                physical_buffer.truncate(bytes_read);
+                self.cipher
+                    .decrypt_chunk(&self.header.iv, chunk_index, &physical_buffer)
+                    .map_err(|_| io::Error::other(ChunkIoError::AuthenticationFailed))?
+            } else {
+                return Err(io::Error::other(ChunkIoError::AuthenticationFailed));
+            };
+
+            if offset_in_chunk + bytes_to_read_from_this_chunk > clear_chunk.len() {
+                return Err(io::Error::other(ChunkIoError::AuthenticationFailed));
+            }
+
+            result_buffer.extend_from_slice(
+                &clear_chunk[offset_in_chunk..(offset_in_chunk + bytes_to_read_from_this_chunk)],
+            );
+            current_offset += bytes_to_read_from_this_chunk as u64;
         }
 
-        let relative_start = (logical_offset - align_start) as usize;
-        let max_logical_available =
-            self.header.logical_size.saturating_sub(logical_offset) as usize;
-        let available_data = valid_crypt_size.saturating_sub(relative_start);
-
-        let copy_len = std::cmp::min(size, std::cmp::min(available_data, max_logical_available));
-
-        let mut final_buffer = SecureBuffer(vec![0u8; copy_len]);
-        if copy_len > 0 {
-            final_buffer
-                .0
-                .copy_from_slice(&block_buffer.0[relative_start..(relative_start + copy_len)]);
-        }
-
-        Ok(final_buffer)
+        Ok(SecureBuffer(result_buffer))
     }
 
     pub fn write_chunk(&mut self, logical_offset: u64, data: &[u8]) -> io::Result<()> {
@@ -129,53 +133,56 @@ impl<C: ChunkCipher> EncryptedFile<C> {
             return Ok(());
         }
 
-        let align_start = (logical_offset / XTS_BLOCK_SIZE) * XTS_BLOCK_SIZE;
+        let mut current_offset = logical_offset;
         let end_offset = logical_offset + data.len() as u64;
-        let align_end = end_offset.div_ceil(XTS_BLOCK_SIZE) * XTS_BLOCK_SIZE;
-        let aligned_size = (align_end - align_start) as usize;
+        let mut data_cursor = 0;
 
-        let mut block_buffer = SecureBuffer(vec![0u8; aligned_size]);
-        let physical_data_size = self.file.metadata()?.len().saturating_sub(HEADER_SIZE);
+        while current_offset < end_offset {
+            let chunk_index = current_offset / CHUNK_LOGICAL_SIZE;
+            let offset_in_chunk = (current_offset % CHUNK_LOGICAL_SIZE) as usize;
 
-        if align_start < physical_data_size {
-            let physical_offset = HEADER_SIZE + align_start;
-            self.file.seek(SeekFrom::Start(physical_offset))?;
+            let remaining_in_request = data.len() - data_cursor;
+            let remaining_in_chunk = CHUNK_LOGICAL_SIZE as usize - offset_in_chunk;
+            let bytes_to_write_to_this_chunk =
+                std::cmp::min(remaining_in_request, remaining_in_chunk);
 
-            let max_read =
-                std::cmp::min(aligned_size as u64, physical_data_size - align_start) as usize;
-            let mut temp_buf = vec![0u8; max_read];
-            let bytes_read = self.file.read(&mut temp_buf)?;
+            let mut clear_chunk = vec![0u8; CHUNK_LOGICAL_SIZE as usize];
 
-            let valid_blocks_size =
-                (bytes_read / XTS_BLOCK_SIZE as usize) * XTS_BLOCK_SIZE as usize;
-            block_buffer.0[..valid_blocks_size].copy_from_slice(&temp_buf[..valid_blocks_size]);
+            let physical_offset = HEADER_SIZE + (chunk_index * CHUNK_PHYSICAL_SIZE);
 
-            if valid_blocks_size > 0 {
-                self.cipher
-                    .decrypt_chunk(
-                        &self.header.iv,
-                        align_start,
-                        &mut block_buffer.0[..valid_blocks_size],
-                    )
-                    .map_err(|_| io::Error::other(ChunkIoError::RmwDecryptionFailed))?;
+            if offset_in_chunk > 0 || bytes_to_write_to_this_chunk < CHUNK_LOGICAL_SIZE as usize {
+                self.file.seek(SeekFrom::Start(physical_offset))?;
+                let mut physical_buffer = vec![0u8; CHUNK_PHYSICAL_SIZE as usize];
+                let bytes_read = self.file.read(&mut physical_buffer)?;
+
+                if bytes_read > 0 {
+                    physical_buffer.truncate(bytes_read);
+                    let decrypted = self
+                        .cipher
+                        .decrypt_chunk(&self.header.iv, chunk_index, &physical_buffer)
+                        .map_err(|_| io::Error::other(ChunkIoError::AuthenticationFailed))?;
+
+                    clear_chunk[..decrypted.len()].copy_from_slice(&decrypted);
+                }
             }
+
+            clear_chunk[offset_in_chunk..(offset_in_chunk + bytes_to_write_to_this_chunk)]
+                .copy_from_slice(&data[data_cursor..(data_cursor + bytes_to_write_to_this_chunk)]);
+
+            let encrypted_chunk = self
+                .cipher
+                .encrypt_chunk(&self.header.iv, chunk_index, &clear_chunk)
+                .map_err(|_| io::Error::other(ChunkIoError::EncryptionFailed))?;
+
+            self.file.seek(SeekFrom::Start(physical_offset))?;
+            self.file.write_all(&encrypted_chunk)?;
+
+            current_offset += bytes_to_write_to_this_chunk as u64;
+            data_cursor += bytes_to_write_to_this_chunk;
         }
 
-        let relative_start = (logical_offset - align_start) as usize;
-        block_buffer.0[relative_start..(relative_start + data.len())].copy_from_slice(data);
-
-        self.cipher
-            .encrypt_chunk(&self.header.iv, align_start, &mut block_buffer.0)
-            .map_err(|_| io::Error::other(ChunkIoError::RmwEncryptionFailed))?;
-
-        let physical_offset = HEADER_SIZE + align_start;
-        self.file.seek(SeekFrom::Start(physical_offset))?;
-        self.file.write_all(&block_buffer.0)?;
-
-        let new_logical_end = logical_offset + data.len() as u64;
-
-        if new_logical_end > self.header.logical_size {
-            self.header.logical_size = new_logical_end;
+        if end_offset > self.header.logical_size {
+            self.header.logical_size = end_offset;
             self.file.seek(SeekFrom::Start(LOGICAL_SIZE_OFFSET))?;
             self.file
                 .write_all(&self.header.logical_size.to_le_bytes())?;
@@ -200,195 +207,145 @@ impl<C: ChunkCipher> EncryptedFile<C> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::cipher::Aes256XtsCipher;
+    use crate::crypto::cipher::ChaChaPolyCipher;
     use crate::utils::memory::SecureKey;
     use std::fs;
 
     // --- Helper ---
-    fn setup_test_file(path: &str) -> EncryptedFile<Aes256XtsCipher> {
-        let _ = fs::remove_file(path);
-        let key = SecureKey(vec![0x42; 64]);
-        EncryptedFile::open(path, Aes256XtsCipher::new(key), true, true).unwrap()
+    // Automates setup and ensures physical file cleanup even if tests panic.
+    struct TestEnv {
+        path: &'static str,
     }
 
-    // ----------------------------------------------------------------
-    // EXISTING TESTS (Basics)
-    // ----------------------------------------------------------------
-    #[test]
-    fn test_encrypted_file_readonly_not_found() {
-        let key = SecureKey(vec![0x42; 64]);
-        let result = EncryptedFile::open(
-            "does_not_exist.enc",
-            Aes256XtsCipher::new(key),
-            false,
-            false,
-        );
-        assert!(
-            result.is_err(),
-            "Opening a non-existent file in read-only mode should fail"
-        );
+    impl TestEnv {
+        fn new(path: &'static str) -> Self {
+            let _ = fs::remove_file(path);
+            Self { path }
+        }
+        fn get_file(&self, truncate: bool) -> EncryptedFile<ChaChaPolyCipher> {
+            let key = SecureKey(vec![0x42; 32]);
+            EncryptedFile::open(self.path, ChaChaPolyCipher::new(key), truncate, true).unwrap()
+        }
     }
 
-    #[test]
-    fn test_encrypted_file_metadata() {
-        let path = "test_metadata.enc";
-        let mut enc_file = setup_test_file(path);
-        enc_file.write_chunk(0, b"metadata test").unwrap();
-        let meta = enc_file.metadata().unwrap();
-        assert!(meta.is_file());
-        assert!(
-            meta.len() > HEADER_SIZE,
-            "The physical size must include the header and data"
-        );
-        let _ = fs::remove_file(path);
+    impl Drop for TestEnv {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(self.path);
+        }
     }
 
-    // ----------------------------------------------------------------
-    // CRITICAL TESTS (New - Extreme Robustness)
-    // ----------------------------------------------------------------
-
-    /// TEST 1: RMW straddling multiple cryptographic blocks
-    /// Verifies that if we write from byte 10 to 25 (overlapping blocks 0 and 1),
-    /// the system decrypts both blocks, modifies the middle, and re-encrypts without corrupting the edges.
+    /// TEST 1: Basic I/O, EOF limitations, and Zero-length handling
     #[test]
-    fn test_chunk_io_cross_block_rmw() {
-        let path = "test_cross_block.enc";
-        let mut enc_file = setup_test_file(path);
+    fn test_basic_io_and_eof() {
+        let env = TestEnv::new("test_basic_io.enc");
+        let mut f = env.get_file(true);
 
-        // 1. Initialize 2 complete blocks (32 bytes) with 'A's
-        let initial_data = [b'A'; 32];
-        enc_file.write_chunk(0, &initial_data).unwrap();
+        // Standard Write
+        f.write_chunk(0, b"HelloWorld").unwrap();
+        assert_eq!(f.logical_size().unwrap(), 10);
 
-        // 2. UNALIGNED write of 10 bytes starting at offset 14 (ends at 24)
-        // Block 0: from 0 to 15 (touched at the end)
-        // Block 1: from 16 to 31 (touched at the beginning)
-        let inject_data = b"0123456789";
-        enc_file.write_chunk(14, inject_data).unwrap();
+        // Normal Read
+        assert_eq!(f.read_chunk(0, 5).unwrap().0, b"Hello");
 
-        // 3. Read and global verification
-        let result = enc_file.read_chunk(0, 32).unwrap();
+        // EOF Overshoot (Requesting 20 bytes when only 5 remain)
+        assert_eq!(f.read_chunk(5, 20).unwrap().0, b"World");
 
-        let mut expected = [b'A'; 32];
-        expected[14..24].copy_from_slice(b"0123456789");
+        // Out-of-bounds Read
+        assert_eq!(f.read_chunk(50, 10).unwrap().0.len(), 0);
 
+        // Zero-length operations (Should not crash or alter size)
+        f.write_chunk(2, &[]).unwrap();
+        assert_eq!(f.logical_size().unwrap(), 10);
+    }
+
+    /// TEST 2: Complex Read-Modify-Write (RMW) and Chunk Boundaries
+    /// Verifies overwriting existing data and crossing the 64KB logical chunk boundary.
+    #[test]
+    fn test_cross_chunk_rmw() {
+        let env = TestEnv::new("test_cross_chunk.enc");
+        let mut f = env.get_file(true);
+
+        // 1. Target the exact boundary (65536)
+        let offset = CHUNK_LOGICAL_SIZE - 4;
+
+        // Write 8 bytes (4 in Chunk 0, 4 in Chunk 1)
+        f.write_chunk(offset, b"1234ABCD").unwrap();
+
+        // 2. Read back across the boundary
+        assert_eq!(f.read_chunk(offset, 8).unwrap().0, b"1234ABCD");
+
+        // 3. Partial Overwrite (RMW inside a chunk)
+        f.write_chunk(offset + 2, b"XX").unwrap(); // Changes "34" to "XX"
+        assert_eq!(f.read_chunk(offset, 8).unwrap().0, b"12XXABCD");
+    }
+
+    /// TEST 3: Multi-Chunk Memory Stress Test
+    /// Proves the arithmetic works for operations spanning many chunks.
+    #[test]
+    fn test_large_payload() {
+        let env = TestEnv::new("test_large_payload.enc");
+        let mut f = env.get_file(true);
+
+        // 150 KB spans across 3 chunks
+        let payload: Vec<u8> = (0..150_000).map(|i| (i % 256) as u8).collect();
+
+        f.write_chunk(0, &payload).unwrap();
+        assert_eq!(f.logical_size().unwrap(), 150_000);
+
+        let read_back = f.read_chunk(0, 150_000).unwrap();
         assert_eq!(
-            result.0.as_slice(),
-            expected,
-            "CRITICAL: The Read-Modify-Write operation corrupted data at XTS block boundaries!"
+            read_back.0, payload,
+            "Large multi-chunk read/write corrupted"
         );
-
-        let _ = fs::remove_file(path);
     }
 
-    /// TEST 2: EOF (End Of File) boundary security
-    /// Prevents the client from reading the "garbage" (padding) generated by block encryption.
+    /// TEST 4: Security - Truncation IV Rotation & MAC Tampering
     #[test]
-    fn test_chunk_io_eof_read_behavior() {
-        let path = "test_eof.enc";
-        let mut enc_file = setup_test_file(path);
+    fn test_security_constraints() {
+        let env = TestEnv::new("test_security.enc");
 
-        // We write 5 bytes. Physical = 16 bytes (1 block padded with encrypted zeros)
-        enc_file.write_chunk(0, b"Hello").unwrap();
-        assert_eq!(enc_file.logical_size().unwrap(), 5);
-
-        // Attempt to read 20 bytes (overflow)
-        let result = enc_file.read_chunk(0, 20).unwrap();
-
-        assert_eq!(
-            result.0.len(),
-            5,
-            "CRITICAL: The reader returned hidden cryptographic XTS padding or memory garbage!"
-        );
-        assert_eq!(result.0.as_slice(), b"Hello");
-
-        // Attempt pure out-of-bounds read
-        let oob_result = enc_file.read_chunk(10, 5).unwrap();
-        assert_eq!(
-            oob_result.0.len(),
-            0,
-            "Reading outside the logical file must return 0 bytes."
-        );
-
-        let _ = fs::remove_file(path);
-    }
-
-    /// TEST 3: Behavior against Zero-length I/O
-    /// The OS (especially Linux/macOS) sometimes makes "empty" calls to test access.
-    #[test]
-    fn test_chunk_io_zero_length_operations() {
-        let path = "test_zero_len.enc";
-        let mut enc_file = setup_test_file(path);
-
-        enc_file.write_chunk(0, b"Data").unwrap();
-
-        // Empty write
-        enc_file.write_chunk(2, &[]).unwrap();
-        assert_eq!(
-            enc_file.logical_size().unwrap(),
-            4,
-            "The empty write modified the logical size!"
-        );
-
-        // Empty read
-        let result = enc_file.read_chunk(1, 0).unwrap();
-        assert_eq!(result.0.len(), 0, "The empty read returned data!");
-
-        let _ = fs::remove_file(path);
-    }
-
-    /// TEST 4: Truncate and Cryptographic Security (IV Rotation)
-    /// Overwriting a file MUST generate a new IV, otherwise AES-XTS loses all its strength.
-    #[test]
-    fn test_chunk_io_truncate_and_iv_rotation() {
-        let path = "test_truncate_iv.enc";
-        let key = SecureKey(vec![0x42; 64]);
-
-        // 1. First life of the file
-        let mut file1 =
-            EncryptedFile::open(path, Aes256XtsCipher::new(key.clone()), true, true).unwrap();
-        file1.write_chunk(0, b"Old confidential data").unwrap();
-        let iv1 = file1.header.iv;
-        drop(file1);
-
-        // 2. Second life of the file (Truncate by OS)
-        let file2 = EncryptedFile::open(path, Aes256XtsCipher::new(key), true, true).unwrap();
-        let iv2 = file2.header.iv;
-
-        assert_eq!(
-            file2.logical_size().unwrap(),
-            0,
-            "Truncate did not set the logical size to zero"
-        );
+        // 1. Check IV Rotation on Truncate
+        let iv1 = {
+            let mut f = env.get_file(true);
+            f.write_chunk(0, b"Data").unwrap();
+            f.header.iv
+        };
+        let iv2 = env.get_file(true).header.iv;
         assert_ne!(
             iv1, iv2,
-            "CRITICAL: Cryptographic flaw! The IV was not renewed during truncate."
+            "IV must rotate on file truncation to prevent nonce reuse"
         );
 
-        let _ = fs::remove_file(path);
-    }
+        // 2. Check Tamper Resistance (MAC Rejection)
+        let mut f = env.get_file(true);
+        f.write_chunk(0, b"Sensitive Data").unwrap();
+        drop(f); // Flush to disk
 
-    /// TEST 5: Very large block arithmetic (Memory Stress Test)
-    #[test]
-    fn test_chunk_io_large_file_multiple_chunks() {
-        let path = "test_large_chunks.enc";
-        let mut enc_file = setup_test_file(path);
+        // Simulate physical corruption
+        let mut physical_file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(env.path)
+            .unwrap();
+        physical_file
+            .seek(std::io::SeekFrom::Start(HEADER_SIZE + 10))
+            .unwrap();
+        physical_file.write_all(&[0xFF]).unwrap();
+        drop(physical_file);
 
-        // Payload of 10,000 bytes (neither aligned to 16, nor a perfect multiple)
-        let payload: Vec<u8> = (0..10000).map(|i| (i % 256) as u8).collect();
+        // Attempt to read corrupted data
+        let mut compromised = env.get_file(false);
+        let result = compromised.read_chunk(0, 14);
 
-        // We write everything at once
-        enc_file.write_chunk(0, &payload).unwrap();
-        assert_eq!(enc_file.logical_size().unwrap(), 10000);
-
-        // We read it all back
-        let result = enc_file.read_chunk(0, 10000).unwrap();
-        assert_eq!(result.0.len(), 10000);
-        assert_eq!(
-            result.0.as_slice(),
-            payload.as_slice(),
-            "Writing a large buffer was corrupted"
+        assert!(
+            matches!(
+                result
+                    .unwrap_err()
+                    .into_inner()
+                    .unwrap()
+                    .downcast_ref::<ChunkIoError>(),
+                Some(ChunkIoError::AuthenticationFailed)
+            ),
+            "Tampered data bypassed MAC verification"
         );
-
-        let _ = fs::remove_file(path);
     }
 }

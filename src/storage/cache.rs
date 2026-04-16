@@ -3,11 +3,11 @@ use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
-use crate::crypto::cipher::Aes256XtsCipher;
+use crate::crypto::cipher::ChaChaPolyCipher;
 use crate::storage::chunk_io::EncryptedFile;
 
-// --- ADDITION: Structured enum for custom errors ---
 #[derive(Debug)]
 pub enum CacheError {
     FileOpenFailed,
@@ -25,34 +25,45 @@ impl fmt::Display for CacheError {
 }
 
 impl std::error::Error for CacheError {}
-// ----------------------------------------------------------------------
+
+struct CacheEntry {
+    file: Arc<Mutex<EncryptedFile<ChaChaPolyCipher>>>,
+    last_accessed: Instant,
+}
 
 pub struct FileCache {
-    entries: DashMap<PathBuf, Arc<Mutex<EncryptedFile<Aes256XtsCipher>>>>,
+    entries: DashMap<PathBuf, CacheEntry>,
+    max_capacity: usize,
 }
 
 impl FileCache {
-    pub fn new() -> Self {
+    pub fn new(max_capacity: usize) -> Self {
         Self {
             entries: DashMap::new(),
+            max_capacity,
         }
     }
 
     pub fn get_or_open(
         &self,
         path: &Path,
-        cipher: Aes256XtsCipher,
+        cipher: ChaChaPolyCipher,
         truncate: bool,
         write_access: bool,
-    ) -> io::Result<Arc<Mutex<EncryptedFile<Aes256XtsCipher>>>> {
+    ) -> io::Result<Arc<Mutex<EncryptedFile<ChaChaPolyCipher>>>> {
         let path_buf = path.to_path_buf();
 
         if truncate {
             self.entries.remove(&path_buf);
         }
 
-        if let Some(entry) = self.entries.get(&path_buf) {
-            return Ok(entry.value().clone());
+        if let Some(mut entry) = self.entries.get_mut(&path_buf) {
+            entry.last_accessed = Instant::now();
+            return Ok(entry.file.clone());
+        }
+
+        if self.entries.len() >= self.max_capacity {
+            self.evict_oldest();
         }
 
         let file = EncryptedFile::open(path, cipher, truncate, write_access)
@@ -60,13 +71,24 @@ impl FileCache {
 
         let shared_file = Arc::new(Mutex::new(file));
 
-        self.entries.insert(path_buf.clone(), shared_file.clone());
+        self.entries.insert(
+            path_buf.clone(),
+            CacheEntry {
+                file: shared_file.clone(),
+                last_accessed: Instant::now(),
+            },
+        );
 
         Ok(shared_file)
     }
 
-    pub fn get_cached(&self, path: &Path) -> Option<Arc<Mutex<EncryptedFile<Aes256XtsCipher>>>> {
-        self.entries.get(path).map(|entry| entry.value().clone())
+    pub fn get_cached(&self, path: &Path) -> Option<Arc<Mutex<EncryptedFile<ChaChaPolyCipher>>>> {
+        if let Some(mut entry) = self.entries.get_mut(path) {
+            entry.last_accessed = Instant::now();
+            Some(entry.file.clone())
+        } else {
+            None
+        }
     }
 
     pub fn remove(&self, path: &Path) {
@@ -75,9 +97,29 @@ impl FileCache {
 
     pub fn flush_all(&self) {
         for entry in self.entries.iter() {
-            if let Ok(mut file) = entry.value().lock() {
+            if let Ok(mut file) = entry.value().file.lock() {
                 let _ = file.flush();
             }
+        }
+    }
+
+    fn evict_oldest(&self) {
+        let mut oldest_path = None;
+        let mut oldest_time = None;
+
+        for entry in self.entries.iter() {
+            let time = entry.value().last_accessed;
+            if oldest_time.is_none_or(|t| time < t) {
+                oldest_time = Some(time);
+                oldest_path = Some(entry.key().clone());
+            }
+        }
+
+        if let Some(path) = oldest_path
+            && let Some((_, entry)) = self.entries.remove(&path)
+            && let Ok(mut file) = entry.file.lock()
+        {
+            let _ = file.flush();
         }
     }
 }
@@ -88,122 +130,135 @@ mod tests {
     use std::fs;
     use std::sync::Arc;
     use std::thread;
+    use std::time::Duration;
 
-    use crate::crypto::cipher::{Aes256XtsCipher, ChunkCipher};
+    use crate::crypto::cipher::{AuthenticatedChunkCipher, ChaChaPolyCipher};
     use crate::utils::memory::SecureKey;
 
     // --- Helper ---
-    // Generates a valid dummy cipher for I/O tests
-    fn dummy_cipher() -> Aes256XtsCipher {
-        Aes256XtsCipher::new(SecureKey(vec![0x42; 64]))
+    fn dummy_cipher() -> ChaChaPolyCipher {
+        ChaChaPolyCipher::new(SecureKey(vec![0x42; 32]))
     }
 
-    /// TEST 1: Verifying Singleton mechanics (Pointer equality)
-    /// The OS might request to open the same file 10 times. The cache MUST return
-    /// the exact same memory instance to avoid corruption (Access Denied).
+    /// TEST 1: Singleton behavior and Truncation replacement
+    /// Ensures we don't open multiple file descriptors for the same path,
+    /// unless explicitly truncated.
     #[test]
-    fn test_cache_singleton_behavior() {
-        let cache = FileCache::new();
+    fn test_cache_singleton_and_truncate() {
+        let cache = FileCache::new(10);
         let path = PathBuf::from("test_cache_singleton.enc");
         let _ = fs::remove_file(&path);
 
         // First open
         let file1 = cache
             .get_or_open(&path, dummy_cipher(), true, true)
-            .expect("Open failed 1");
+            .unwrap();
 
-        // Second open of the SAME file (without truncate)
+        // Second open (should return the exact same Arc)
         let file2 = cache
             .get_or_open(&path, dummy_cipher(), false, true)
-            .expect("Open failed 2");
-
-        // CRITICAL ASSERTION: file1 and file2 MUST point to the same memory address
+            .unwrap();
         assert!(
             Arc::ptr_eq(&file1, &file2),
-            "FAIL: The cache created two distinct instances for the same file!"
+            "Cache should return the same instance for the same path"
         );
 
-        // There should be only one entry in the DashMap
-        assert_eq!(cache.entries.len(), 1);
-
-        let _ = fs::remove_file(&path);
-    }
-
-    /// TEST 2: Truncate mode behavior (Forced eviction)
-    /// If Windows requests to overwrite a file (Truncate), the cache must destroy
-    /// the old reference in RAM and open a fresh new one.
-    #[test]
-    fn test_cache_truncate_forces_eviction() {
-        let cache = FileCache::new();
-        let path = PathBuf::from("test_cache_truncate.enc");
-        let _ = fs::remove_file(&path);
-
-        let file_old = cache
+        // Third open with truncate (should evict and create a new instance)
+        let file_truncated = cache
             .get_or_open(&path, dummy_cipher(), true, true)
             .unwrap();
-
-        // Reopen the file with `truncate = true`
-        let file_new = cache
-            .get_or_open(&path, dummy_cipher(), true, true)
-            .unwrap();
-
-        // CRITICAL ASSERTION: the pointers must be DIFFERENT this time
         assert!(
-            !Arc::ptr_eq(&file_old, &file_new),
-            "FAIL: Truncate mode did not evict the old instance from the cache!"
+            !Arc::ptr_eq(&file1, &file_truncated),
+            "Truncate must replace the cached instance"
         );
 
         let _ = fs::remove_file(&path);
     }
 
-    /// TEST 3: Passive lifecycle (get_cached) and removal (remove)
+    /// TEST 2: Least Recently Used (LRU) Eviction
+    /// Verifies that the cache correctly drops the oldest accessed file when capacity is reached.
     #[test]
-    fn test_cache_passive_read_and_remove() {
-        let cache = FileCache::new();
-        let path = PathBuf::from("test_cache_lifecycle.enc");
+    fn test_cache_capacity_eviction() {
+        let cache = FileCache::new(2); // Strict capacity of 2
+        let p1 = PathBuf::from("evict_1.enc");
+        let p2 = PathBuf::from("evict_2.enc");
+        let p3 = PathBuf::from("evict_3.enc");
+
+        let _ = fs::remove_file(&p1);
+        let _ = fs::remove_file(&p2);
+        let _ = fs::remove_file(&p3);
+
+        let _ = cache.get_or_open(&p1, dummy_cipher(), true, true).unwrap();
+        thread::sleep(Duration::from_millis(10)); // Ensure distinct timestamps
+
+        let _ = cache.get_or_open(&p2, dummy_cipher(), true, true).unwrap();
+
+        // Touch p1 again so p2 becomes the oldest
+        let _ = cache.get_cached(&p1).unwrap();
+        thread::sleep(Duration::from_millis(10));
+
+        // Opening p3 should evict p2, as p1 was just accessed
+        let _ = cache.get_or_open(&p3, dummy_cipher(), true, true).unwrap();
+
+        assert!(
+            cache.get_cached(&p1).is_some(),
+            "p1 should still be cached (recently accessed)"
+        );
+        assert!(
+            cache.get_cached(&p2).is_none(),
+            "p2 should be evicted (oldest)"
+        );
+        assert!(
+            cache.get_cached(&p3).is_some(),
+            "p3 should be cached (newest)"
+        );
+
+        let _ = fs::remove_file(&p1);
+        let _ = fs::remove_file(&p2);
+        let _ = fs::remove_file(&p3);
+    }
+
+    /// TEST 3: Lifecycle, explicit removal, and flushing
+    #[test]
+    fn test_cache_lifecycle_and_flush() {
+        let cache = FileCache::new(5);
+        let path = PathBuf::from("test_lifecycle.enc");
         let _ = fs::remove_file(&path);
 
-        // 1. Before creation, the cache should return None without I/O
         assert!(cache.get_cached(&path).is_none());
 
-        // 2. Creation
         let _ = cache
             .get_or_open(&path, dummy_cipher(), true, true)
             .unwrap();
+        assert!(cache.get_cached(&path).is_some());
 
-        // 3. get_cached should now return Some (the file is in RAM)
-        assert!(
-            cache.get_cached(&path).is_some(),
-            "FAIL: get_cached did not find the freshly created file"
-        );
+        // Ensure global flush executes without panicking or deadlocking
+        cache.flush_all();
 
-        // 4. Explicit removal
         cache.remove(&path);
         assert!(
             cache.get_cached(&path).is_none(),
-            "FAIL: remove() did not purge the file from the cache"
+            "Explicit remove should purge the file"
         );
 
         let _ = fs::remove_file(&path);
     }
 
-    /// TEST 4: Resistance to massive concurrency (Race Conditions)
-    /// Simulates an aggressive file explorer (e.g., macOS Finder) launching
-    /// 20 simultaneous threads to read the same file.
+    /// TEST 4: Heavy Concurrency
+    /// Proves the DashMap usage safely prevents race conditions during parallel access.
     #[test]
     fn test_cache_heavy_concurrency() {
-        let cache = Arc::new(FileCache::new());
-        let path = Arc::new(PathBuf::from("test_cache_concurrent.enc"));
-
-        // Clean initialization
+        let cache = Arc::new(FileCache::new(10));
+        let path = Arc::new(PathBuf::from("test_concurrent.enc"));
         let _ = fs::remove_file(path.as_ref());
+
+        // Pre-initialize the file
         let _ = cache
             .get_or_open(path.as_ref(), dummy_cipher(), true, true)
             .unwrap();
 
         let mut handles = vec![];
 
-        // Launch 20 threads trying to access the same file
         for _ in 0..20 {
             let cache_clone = cache.clone();
             let path_clone = path.clone();
@@ -215,48 +270,19 @@ mod tests {
             }));
         }
 
-        // Retrieve all pointers
-        let mut resolved_arcs = vec![];
-        for handle in handles {
-            resolved_arcs.push(handle.join().unwrap());
-        }
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
 
-        // CRITICAL ASSERTION: All 20 threads must share EXACTLY the same Arc pointer.
-        // If DashMap is misused, this would create duplicates.
-        let reference_arc = &resolved_arcs[0];
-        for arc in resolved_arcs.iter().skip(1) {
+        // Ensure all 20 threads received the exact same underlying Arc<Mutex<EncryptedFile>>
+        let reference_arc = &results[0];
+        for res in results.iter().skip(1) {
             assert!(
-                Arc::ptr_eq(reference_arc, arc),
-                "FAIL: Race condition detected! Multiple instances created in parallel."
+                Arc::ptr_eq(reference_arc, res),
+                "Race condition detected: Multiple instances spawned concurrently"
             );
         }
 
-        // The final DashMap must still contain only one logical entry.
-        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(cache.entries.len(), 1, "Cache should only contain 1 entry");
 
         let _ = fs::remove_file(path.as_ref());
-    }
-
-    /// TEST 5: Safety of global Flush on server shutdown
-    #[test]
-    fn test_cache_flush_all() {
-        let cache = FileCache::new();
-        let path1 = PathBuf::from("test_flush_1.enc");
-        let path2 = PathBuf::from("test_flush_2.enc");
-        let _ = fs::remove_file(&path1);
-        let _ = fs::remove_file(&path2);
-
-        let _ = cache
-            .get_or_open(&path1, dummy_cipher(), true, true)
-            .unwrap();
-        let _ = cache
-            .get_or_open(&path2, dummy_cipher(), true, true)
-            .unwrap();
-
-        // Must not panic, nor create a deadlock (cross-locking)
-        cache.flush_all();
-
-        let _ = fs::remove_file(&path1);
-        let _ = fs::remove_file(&path2);
     }
 }

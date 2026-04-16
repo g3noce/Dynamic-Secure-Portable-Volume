@@ -4,9 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+
 # --- Cryptographie & Sécurité ---
-aes = "0.8.4"
-xts-mode = "0.5.1"
+chacha20poly1305 = "0.10"
 argon2 = "0.5.3"
 rand = "0.10.0"
 zeroize = { version = "1.8.2", features = ["zeroize_derive"] }
@@ -26,3 +26,6 @@ dashmap = "6.1.0"
 fs4 = "0.13.1"
 rpassword = "7.4.0"
 clap = { version = "4.5", features = ["derive"] }
+uuid = "1.23.1"
+serde_json = "1.0.149"
+serde = { version = "1.0.228", features = ["derive"] }
