@@ -1,3 +1,9 @@
+> [!WARNING]
+> **Disclaimer**
+> This software is provided "as is". While it implements strong cryptographic primitives, the security of your data ultimately depends on the strength of your password and the physical security of the host machine (which could be compromised by keyloggers or malware). Always keep backups of your encrypted vaults.
+
+---
+
 # 🔐 Dynamic Secure Portable Volume (DSPV)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -67,9 +73,3 @@ The project includes an extensive suite of critical resilience and cryptographic
 ```bash
 cargo test
 ```
-
----
-
-> [!WARNING]
-> **Disclaimer**
-> This software is provided "as is". While it implements strong cryptographic primitives, the security of your data ultimately depends on the strength of your password and the physical security of the host machine (which could be compromised by keyloggers or malware). Always keep backups of your encrypted vaults.
