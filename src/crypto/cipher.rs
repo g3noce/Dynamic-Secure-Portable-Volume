@@ -13,14 +13,12 @@ pub enum CipherError {
 impl fmt::Display for CipherError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let cause = match self {
-            CipherError::InitializationFailed => {
-                "taille de clé (doit être 64) ou IV (doit être 16) invalide"
-            }
-            CipherError::AlignmentError => "les données ne sont pas un multiple de 16 octets",
+            CipherError::InitializationFailed => "invalid key size (must be 64) or IV (must be 16)",
+            CipherError::AlignmentError => "data is not a multiple of 16 bytes",
         };
         write!(
             f,
-            "mod : cipher , fonction : traitement_chunk , cause : {}",
+            "mod: cipher, function: chunk_processing, cause: {}",
             cause
         )
     }
@@ -125,7 +123,7 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
-    // TESTS EXISTANTS (Mécanique de base)
+    // EXISTING TESTS (Basic Mechanics)
     // ----------------------------------------------------------------
 
     #[test]
@@ -145,7 +143,7 @@ mod tests {
 
     #[test]
     fn test_cipher_initialization_error() {
-        let cipher = Aes256XtsCipher::new(SecureKey(vec![0x42; 32])); // Clé trop courte
+        let cipher = Aes256XtsCipher::new(SecureKey(vec![0x42; 32])); // Key too short
         let mut data = vec![0u8; 16];
 
         let result = cipher.encrypt_chunk(&dummy_iv(), 0, &mut data);
@@ -155,17 +153,17 @@ mod tests {
     #[test]
     fn test_cipher_alignment_error() {
         let cipher = dummy_cipher();
-        let mut unaligned_data = vec![0u8; 15]; // Non multiple de 16
+        let mut unaligned_data = vec![0u8; 15]; // Not a multiple of 16
 
         let result = cipher.encrypt_chunk(&dummy_iv(), 0, &mut unaligned_data);
         assert!(matches!(result, Err(CipherError::AlignmentError)));
     }
 
     // ----------------------------------------------------------------
-    // TESTS CRITIQUES (Propriétés Cryptographiques)
+    // CRITICAL TESTS (Cryptographic Properties)
     // ----------------------------------------------------------------
 
-    /// TEST 1 : L'empreinte doit changer selon la position (Offset/Tweak)
+    /// TEST 1: The fingerprint must change depending on the position (Offset/Tweak)
     #[test]
     fn test_cipher_offset_dependence() {
         let cipher = dummy_cipher();
@@ -182,11 +180,11 @@ mod tests {
 
         assert_ne!(
             data_at_offset_0, data_at_offset_16,
-            "CRITICAL: L'AES-XTS a produit le même chiffré pour deux offsets différents. Le calcul du sector_index est défaillant."
+            "CRITICAL: AES-XTS produced the same ciphertext for two different offsets. The sector_index calculation is faulty."
         );
     }
 
-    /// TEST 2 : L'empreinte doit changer selon l'IV (Renouvellement)
+    /// TEST 2: The fingerprint must change depending on the IV (Renewal)
     #[test]
     fn test_cipher_iv_dependence() {
         let cipher = dummy_cipher();
@@ -202,22 +200,22 @@ mod tests {
 
         assert_ne!(
             data_iv1, data_iv2,
-            "CRITICAL: Le changement d'IV n'a pas modifié la signature cryptographique."
+            "CRITICAL: Changing the IV did not alter the cryptographic signature."
         );
     }
 
-    /// TEST 3 : Cohérence entre le chiffrement global et fragmenté (Streaming)
+    /// TEST 3: Consistency between global and fragmented encryption (Streaming)
     #[test]
     fn test_cipher_cross_chunk_equivalence() {
         let cipher = dummy_cipher();
         let iv = dummy_iv();
-        let payload = [b'C'; 32]; // 2 blocs stricts
+        let payload = [b'C'; 32]; // 2 strict blocks
 
-        // Chiffrement d'un seul bloc de 32 octets
+        // Encrypting a single 32-byte block
         let mut monolithic_data = payload;
         cipher.encrypt_chunk(&iv, 0, &mut monolithic_data).unwrap();
 
-        // Chiffrement fragmenté : deux appels de 16 octets
+        // Fragmented encryption: two 16-byte calls
         let mut fragmented_data = payload;
         let (part1, part2) = fragmented_data.split_at_mut(16);
 
@@ -226,11 +224,11 @@ mod tests {
 
         assert_eq!(
             monolithic_data, fragmented_data,
-            "CRITICAL: Le chiffrement en flux (chunking) casse la structure XTS. Les blocs ne s'alignent pas correctement."
+            "CRITICAL: Stream encryption (chunking) breaks the XTS structure. Blocks do not align correctly."
         );
     }
 
-    /// TEST 4 : Isolation des secteurs et Effet Avalanche (Bit-flipping attack)
+    /// TEST 4: Sector isolation and Avalanche Effect (Bit-flipping attack)
     #[test]
     fn test_cipher_sector_isolation_and_avalanche() {
         let cipher = dummy_cipher();
@@ -239,45 +237,45 @@ mod tests {
         let original_data = [b'D'; 32];
         let mut data = original_data;
 
-        // 1. On chiffre les 32 octets
+        // 1. Encrypt all 32 bytes
         cipher.encrypt_chunk(&iv, 0, &mut data).unwrap();
 
-        // 2. L'attaquant corrompt un seul bit dans le premier secteur (offset 5)
+        // 2. Attacker corrupts a single bit in the first sector (offset 5)
         data[5] ^= 0b0000_0001;
 
-        // 3. On déchiffre le tout
+        // 3. Decrypt everything
         cipher.decrypt_chunk(&iv, 0, &mut data).unwrap();
 
-        // 4. Vérification de l'effet Avalanche : Le premier secteur (0-15) doit être totalement détruit
+        // 4. Verification of the Avalanche effect: The first sector (0-15) must be completely destroyed
         assert_ne!(
             &data[0..16],
             &original_data[0..16],
-            "CRITICAL: L'effet avalanche n'a pas eu lieu sur le secteur corrompu."
+            "CRITICAL: The avalanche effect did not occur on the corrupted sector."
         );
 
-        // 5. Vérification de l'isolation : Le second secteur (16-31) doit être intact
+        // 5. Verification of isolation: The second sector (16-31) must remain intact
         assert_eq!(
             &data[16..32],
             &original_data[16..32],
-            "CRITICAL: La corruption d'un secteur a débordé sur le secteur adjacent. L'isolation XTS est brisée."
+            "CRITICAL: Corruption of one sector spilled over to the adjacent sector. XTS isolation is broken."
         );
     }
 
-    /// TEST 5 : Résistance aux limites extrêmes (Integer Overflow)
+    /// TEST 5: Resistance to extreme limits (Integer Overflow)
     #[test]
     fn test_cipher_extreme_offset_wrapping() {
         let cipher = dummy_cipher();
-        let iv = [0xFF; 16]; // Pousse l'addition interne du `sector_index` dans ses limites
+        let iv = [0xFF; 16]; // Pushes the internal addition of `sector_index` to its limits
         let mut data = [b'E'; 16];
 
-        // Un offset immense proche de la limite du type
+        // A massive offset near the type's limit
         let extreme_offset = u64::MAX - 15;
 
-        // Le wrapping_add ne doit pas faire paniquer le thread
+        // The wrapping_add must not cause the thread to panic
         let result = cipher.encrypt_chunk(&iv, extreme_offset, &mut data);
         assert!(
             result.is_ok(),
-            "Le calcul du sector_index a paniqué face à un offset extrême."
+            "The sector_index calculation panicked when facing an extreme offset."
         );
     }
 }

@@ -20,7 +20,7 @@ use crate::storage::chunk_io::EncryptedFile;
 use crate::storage::header::{HEADER_SIZE, LOGICAL_SIZE_OFFSET};
 use crate::utils::memory::SecureKey;
 
-// --- AJOUT : Énumération structurée pour les erreurs personnalisées ---
+// --- ADDITION: Structured enumeration for custom errors ---
 #[derive(Debug)]
 pub enum WebDavError {
     LockFailed(&'static str),
@@ -43,33 +43,23 @@ pub enum WebDavError {
 impl fmt::Display for WebDavError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let (func, cause) = match self {
-            WebDavError::LockFailed(f_name) => {
-                (*f_name, "impossible de verrouiller le fichier partagé")
-            }
-            WebDavError::WriteChunkFailed => ("write_bytes", "échec d'écriture du chunk chiffré"),
-            WebDavError::ReadChunkFailed => ("read_bytes", "échec de lecture du chunk chiffré"),
-            WebDavError::FlushFailed => ("flush", "échec du vidage sur disque"),
-            WebDavError::CacheOpenFailed => ("open", "échec d'ouverture ou création via le cache"),
-            WebDavError::MetadataFailed => ("metadata", "échec de récupération des métadonnées OS"),
-            WebDavError::ReadDirFailed => ("read_dir", "échec de lecture du contenu du dossier"),
-            WebDavError::CreateDirFailed => ("create_dir", "échec de création du dossier"),
-            WebDavError::RemoveFileFailed => {
-                ("remove_file", "échec de suppression du fichier physique")
-            }
-            WebDavError::RemoveDirFailed => {
-                ("remove_dir", "échec de suppression du dossier physique")
-            }
-            WebDavError::RenameFailed => ("rename", "échec du renommage sur le disque"),
-            WebDavError::CopySrcOpenFailed => ("copy", "impossible d'ouvrir le fichier source"),
-            WebDavError::CopyDstOpenFailed => ("copy", "impossible de créer le fichier cible"),
-            WebDavError::CopyReadWriteFailed => {
-                ("copy", "échec lors de la lecture/écriture des chunks")
-            }
-            WebDavError::QuotaFailed => {
-                ("get_quota", "échec de calcul de l'espace disque disponible")
-            }
+            WebDavError::LockFailed(f_name) => (*f_name, "unable to lock the shared file"),
+            WebDavError::WriteChunkFailed => ("write_bytes", "failed to write encrypted chunk"),
+            WebDavError::ReadChunkFailed => ("read_bytes", "failed to read encrypted chunk"),
+            WebDavError::FlushFailed => ("flush", "failed to flush to disk"),
+            WebDavError::CacheOpenFailed => ("open", "failed to open or create via cache"),
+            WebDavError::MetadataFailed => ("metadata", "failed to retrieve OS metadata"),
+            WebDavError::ReadDirFailed => ("read_dir", "failed to read directory contents"),
+            WebDavError::CreateDirFailed => ("create_dir", "failed to create directory"),
+            WebDavError::RemoveFileFailed => ("remove_file", "failed to remove physical file"),
+            WebDavError::RemoveDirFailed => ("remove_dir", "failed to remove physical directory"),
+            WebDavError::RenameFailed => ("rename", "failed to rename on disk"),
+            WebDavError::CopySrcOpenFailed => ("copy", "unable to open source file"),
+            WebDavError::CopyDstOpenFailed => ("copy", "unable to create target file"),
+            WebDavError::CopyReadWriteFailed => ("copy", "failed during chunk read/write"),
+            WebDavError::QuotaFailed => ("get_quota", "failed to calculate available disk space"),
         };
-        write!(f, "mod : webdav , fonction : {} , cause : {}", func, cause)
+        write!(f, "mod: webdav, function: {}, cause: {}", func, cause)
     }
 }
 
@@ -205,7 +195,7 @@ impl DavFile for WebDavFile {
             .map_err(|_| WebDavError::WriteChunkFailed)
             .and_then(|res| res)
             .map_err(|e| {
-                eprintln!("{}", e); // Journalisation de l'erreur formatée
+                eprintln!("{}", e); // Logging the formatted error
                 FsError::GeneralFailure
             })?;
 
@@ -382,8 +372,8 @@ impl DavFileSystem for WebDavFS {
             .map_err(|_| WebDavError::MetadataFailed)
             .and_then(|res| res)
             .map_err(|_| {
-                // On ne loggue pas les erreurs Metadata car WebDAV vérifie constamment si un fichier
-                // existe ou non (NotFound attendu), cela spammerait la console inutilement.
+                // We do not log Metadata errors because WebDAV constantly checks if a file
+                // exists or not (NotFound is expected), this would spam the console unnecessarily.
                 FsError::NotFound
             })
         })
@@ -430,7 +420,7 @@ impl DavFileSystem for WebDavFS {
             .await
             .map_err(|_| WebDavError::ReadDirFailed)
             .and_then(|res| res)
-            .map_err(|_| FsError::NotFound)?; // Idem, pas de log pour éviter le spam
+            .map_err(|_| FsError::NotFound)?; // Ditto, no logging to avoid spam
 
             let s = stream::iter(entries.into_iter().map(Ok));
             Ok(Box::pin(s) as _)
@@ -548,7 +538,7 @@ impl DavFileSystem for WebDavFS {
                 Ok(())
             })
             .await
-            .map_err(|_| WebDavError::CopyReadWriteFailed) // Arbitraire pour JoinError
+            .map_err(|_| WebDavError::CopyReadWriteFailed) // Arbitrary for JoinError
             .and_then(|res| res)
             .map_err(|e| {
                 eprintln!("{}", e);
@@ -580,7 +570,7 @@ impl DavFileSystem for WebDavFS {
 }
 
 // ------------------------------------------------------------
-// 5. Tests d'intégration WebDAV
+// 5. WebDAV Integration Tests
 // ------------------------------------------------------------
 
 #[cfg(test)]
@@ -601,14 +591,14 @@ mod tests {
         )
     }
 
-    /// TEST 1 : Cycle de vie complet d'un fichier (Création, I/O, Append, Truncate, Seek, Comportement Windows)
+    /// TEST 1: Full lifecycle of a file (Creation, I/O, Append, Truncate, Seek, Windows Behavior)
     #[tokio::test]
     async fn test_webdav_file_lifecycle_and_io() {
         let root = "test_io";
         let (dav_fs, _) = setup_test_env(root);
         let path = DavPath::new("/lifecycle.enc").unwrap();
 
-        // 1. Création et écriture initiale
+        // 1. Creation and initial write
         {
             let mut f = dav_fs
                 .open(
@@ -624,7 +614,7 @@ mod tests {
             f.write_bytes(Bytes::from("Hello")).await.unwrap();
         }
 
-        // 2. Mode Append (Vérifie que l'offset reprend à la fin sans écraser)
+        // 2. Append Mode (Verify that the offset resumes at the end without overwriting)
         {
             let mut f = dav_fs
                 .open(
@@ -640,7 +630,7 @@ mod tests {
             f.write_bytes(Bytes::from(" World")).await.unwrap();
         }
 
-        // 3. Lecture et Seek (Vérification globale + Simulation OS Windows)
+        // 3. Read and Seek (Global verification + Windows OS Simulation)
         {
             let mut f = dav_fs
                 .open(
@@ -655,23 +645,23 @@ mod tests {
             assert_eq!(
                 f.metadata().await.unwrap().len(),
                 11,
-                "La taille logique doit être de 11 après l'append"
+                "Logical size should be 11 after appending"
             );
 
             f.seek(SeekFrom::Start(0)).await.unwrap();
             assert_eq!(
                 f.read_bytes(11).await.unwrap().as_ref(),
                 b"Hello World",
-                "Le contenu déchiffré est erroné"
+                "The decrypted content is incorrect"
             );
 
-            // Validation des Seek relatifs et par la fin
+            // Validation of relative Seeks and Seeks from the end
             assert_eq!(f.seek(SeekFrom::End(-5)).await.unwrap(), 6);
             assert_eq!(f.seek(SeekFrom::Current(2)).await.unwrap(), 8);
             assert!(f.flush().await.is_ok());
         }
 
-        // 4. Mode Truncate (Écrase les anciennes données)
+        // 4. Truncate Mode (Overwrites old data)
         {
             let mut f = dav_fs
                 .open(
@@ -690,13 +680,13 @@ mod tests {
         assert_eq!(
             dav_fs.metadata(&path).await.unwrap().len(),
             3,
-            "Le Truncate n'a pas réinitialisé la taille logique"
+            "Truncate did not reset the logical size"
         );
 
         let _ = fs::remove_dir_all(root);
     }
 
-    /// TEST 2 : Manipulation de l'arbre de fichiers (Listage filtré, Renommage, Copie, Suppression)
+    /// TEST 2: Manipulating the file tree (Filtered listing, Renaming, Copying, Deletion)
     #[tokio::test]
     async fn test_webdav_fs_operations() {
         let root = "test_fs_ops";
@@ -704,7 +694,7 @@ mod tests {
 
         let p_vis = DavPath::new("/visible.enc").unwrap();
 
-        // CORRECTION 1 : Création propre via WebDAV pour générer le FileHeader (32 octets)
+        // CORRECTION 1: Clean creation via WebDAV to generate the FileHeader (32 bytes)
         {
             let mut f = dav_fs
                 .open(
@@ -720,10 +710,10 @@ mod tests {
             f.write_bytes(Bytes::from("test")).await.unwrap();
         }
 
-        // Le fichier caché peut être créé physiquement car on teste juste qu'il est ignoré par read_dir
+        // The hidden file can be created physically because we're just testing that it's ignored by read_dir
         fs::File::create(PathBuf::from(root).join(".hidden")).unwrap();
 
-        // 2. Filtrage au listage
+        // 2. Filtering during listing
         let root_path = DavPath::new("/").unwrap();
         let entries = dav_fs
             .read_dir(&root_path, ReadDirMeta::None)
@@ -738,30 +728,30 @@ mod tests {
         assert!(names.contains(&"visible.enc".to_string()));
         assert!(
             !names.contains(&".hidden".to_string()),
-            "Les fichiers cachés doivent être ignorés"
+            "Hidden files must be ignored"
         );
 
-        // 3. Copie et Renommage
+        // 3. Copying and Renaming
         let p_copy = DavPath::new("/copy.enc").unwrap();
         let p_rename = DavPath::new("/rename.enc").unwrap();
 
         dav_fs.copy(&p_vis, &p_copy).await.unwrap();
         assert!(
             fs::metadata(PathBuf::from(root).join("copy.enc")).is_ok(),
-            "Copie échouée"
+            "Copy failed"
         );
 
         dav_fs.rename(&p_copy, &p_rename).await.unwrap();
         assert!(
             fs::metadata(PathBuf::from(root).join("copy.enc")).is_err(),
-            "L'ancien fichier post-renommage existe toujours"
+            "The old file still exists post-rename"
         );
         assert!(
             fs::metadata(PathBuf::from(root).join("rename.enc")).is_ok(),
-            "Le nouveau fichier n'existe pas"
+            "The new file does not exist"
         );
 
-        // 4. Suppression
+        // 4. Deletion
         dav_fs.remove_file(&p_vis).await.unwrap();
         dav_fs.remove_file(&p_rename).await.unwrap();
         assert!(fs::metadata(PathBuf::from(root).join("visible.enc")).is_err());
@@ -774,7 +764,7 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    /// TEST 3 : Résolution des Métadonnées (Cache RAM vs Header Physique) et Quota OS
+    /// TEST 3: Metadata Resolution (RAM Cache vs Physical Header) and OS Quota
     #[tokio::test]
     async fn test_webdav_metadata_cache_and_quota() {
         let root = "test_meta_quota";
@@ -782,7 +772,7 @@ mod tests {
         let path = DavPath::new("/cache_test.enc").unwrap();
         let phys_path = PathBuf::from(root).join("cache_test.enc");
 
-        // 1. Test du Cache RAM (Fichier verrouillé et non flushé)
+        // 1. Testing the RAM Cache (File locked and not flushed)
         {
             let mut file = dav_fs
                 .open(
@@ -797,45 +787,42 @@ mod tests {
                 .unwrap();
             file.write_bytes(Bytes::from("Data")).await.unwrap();
 
-            // Le fichier I/O est toujours ouvert, les métadonnées doivent être interceptées depuis le cache RAM
+            // The I/O file is still open, metadata should be intercepted from the RAM cache
             assert_eq!(
                 dav_fs.metadata(&path).await.unwrap().len(),
                 4,
-                "La résolution n'a pas utilisé le cache RAM"
+                "Resolution did not use the RAM cache"
             );
-        } // file est drop ici (flush et fermeture OS garantis)
+        } // file is dropped here (flush and OS close guaranteed)
 
-        // CORRECTION 2 : Éviction explicite du cache RAM pour obliger le système à relire le disque
+        // CORRECTION 2: Explicit eviction from the RAM cache to force the system to re-read the disk
         dav_fs.cache.remove(&phys_path);
 
-        // 2. Test du Fallback I/O (Émulation d'un fichier existant lu depuis le header physique)
+        // 2. Testing the I/O Fallback (Emulating an existing file read from the physical header)
         let mut f = fs::OpenOptions::new().write(true).open(&phys_path).unwrap();
 
-        // On forge un FileHeader avec une fausse taille logique pour prouver qu'il est bien lu sur le disque
+        // We forge a FileHeader with a fake logical size to prove it is indeed read from the disk
         let mut header = crate::storage::header::FileHeader::generate_new();
         header.logical_size = 999;
         f.seek(std::io::SeekFrom::Start(0)).unwrap();
         header.write_to(&mut f).unwrap();
-        drop(f); // Relâchement explicite du lock OS
+        drop(f); // Explicitly releasing the OS lock
 
         assert_eq!(
             dav_fs.metadata(&path).await.unwrap().len(),
             999,
-            "La taille n'a pas été lue depuis le FileHeader physique"
+            "The size was not read from the physical FileHeader"
         );
 
-        // 3. Test du Quota OS
+        // 3. Testing the OS Quota
         let quota_result = dav_fs.get_quota().await;
-        assert!(quota_result.is_ok(), "L'API de quota OS a échoué");
+        assert!(quota_result.is_ok(), "The OS quota API failed");
 
         let (used, total) = quota_result.unwrap();
-        assert!(
-            total.unwrap() > 0,
-            "La taille totale du disque ne peut pas être de 0"
-        );
+        assert!(total.unwrap() > 0, "The total disk size cannot be 0");
         assert!(
             used <= total.unwrap(),
-            "L'espace utilisé ne peut pas dépasser l'espace total"
+            "Used space cannot exceed total space"
         );
 
         let _ = fs::remove_dir_all(root);

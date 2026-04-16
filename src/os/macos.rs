@@ -1,22 +1,17 @@
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 pub fn open_connection(port: u16) -> Result<(), String> {
-    // On utilise webdav:// pour forcer l'ouverture via le Finder et non Safari
-    let url = format!("webdav://127.0.0.1:{}/", port);
-
-    Command::new("open")
-        .arg(&url)
-        .spawn()
-        .map_err(|e| format!("Erreur Open macOS : {}", e))?;
-
+    println!("\n[i] To access the volume on macOS, open a new terminal and type:");
+    println!("    open webdav://127.0.0.1:{}/", port);
     Ok(())
 }
 
 pub fn close_connection(_port: u16) -> Result<(), String> {
-    // Le Finder montera le volume sous l'IP par défaut.
-    // On garde le démontage forcé pour fermer la connexion.
+    // Silent automatic cleanup on shutdown
     let _ = Command::new("diskutil")
         .args(["unmount", "force", "/Volumes/127.0.0.1"])
-        .output();
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
     Ok(())
 }
