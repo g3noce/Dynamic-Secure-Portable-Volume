@@ -6,10 +6,10 @@ mod ui;
 mod utils;
 
 use std::convert::Infallible;
-use std::env;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use clap::Parser; // <-- NOUVEAU
 use dav_server::DavHandler;
 use dav_server::memls::MemLs;
 use hyper::server::conn::http1;
@@ -21,18 +21,28 @@ use tokio::signal;
 use crate::protocol::webdav::WebDavFS;
 use crate::storage::cache::FileCache;
 
+#[derive(Parser)]
+#[command(name = "dspv")]
+#[command(about = "Dynamic Secure Portable Volume - WebDAV server with on-the-fly encryption")]
+struct Cli {
+    /// Physical folder where encrypted files are stored
+    #[arg(default_value = "./secure_volume")]
+    path: String,
+
+    /// Port for the WebDAV server
+    #[arg(short, long, default_value_t = 8080)]
+    port: u16,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("====================================================");
     println!("  Dynamic Secure Portable Volume (WebDAV Server)    ");
     println!("====================================================\n");
 
-    let args: Vec<String> = env::args().collect();
-    let physical_root = if args.len() > 1 {
-        args[1].clone()
-    } else {
-        "./secure_volume".to_string()
-    };
+    let cli = Cli::parse();
+    let physical_root = cli.path;
+    let port = cli.port;
 
     if !std::path::Path::new(&physical_root).exists() {
         std::fs::create_dir_all(&physical_root)?;
@@ -61,13 +71,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .locksystem(MemLs::new())
         .build_handler();
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], 8080));
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let listener = TcpListener::bind(addr).await?;
 
-    println!("\n[+] Server online at http://127.0.0.1:8080/");
+    println!("\n[+] Server online at http://127.0.0.1:{}/", port);
     println!("[*] Press CTRL+C to exit cleanly.");
 
-    if let Err(e) = crate::os::open_connection(8080) {
+    if let Err(e) = crate::os::open_connection(port) {
         eprintln!("[!] Note: {}", e);
     }
 
@@ -97,7 +107,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("\n[!] Shutdown requested.");
 
                 println!("[*] Closing network connection...");
-                let _ = crate::os::close_connection(8080);
+                let _ = crate::os::close_connection(port);
 
                 println!("[*] Finalizing file synchronization...");
                 file_cache.flush_all();
